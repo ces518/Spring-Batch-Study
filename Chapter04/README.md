@@ -628,6 +628,1124 @@ public class DailyJobTimestamper implements JobParametersIncrementer {
 
 ```
 
+### 잡 리스너
+- 모든 잡은 생명주기를 가지고 있고, 스프링 배치에서는 거의 모든 측면에서의 생명주기가 정의되어 있다.
+  - 생명주기의 여러 시점에 로직을 추가할 수 있는 기능을 제공
+
+`JobExecutionListener`
+- 잡의 실행과 관련된 리스너
+
+```java
+public interface JobExecutionListener {
+    void beforeJob(JobExecution var1);
+
+    void afterJob(JobExecution var1);
+}
+```
+
+```java
+/**
+ * 잡 시작/전후 처리
+ * JobExecutionListener 를 구현하는 방식 / 애노테이션 사용방식 두가지를 제공
+ * 리스너는 스탭, 리더, 라이터 등 다양한 컴포넌트에도 사용이 가능하다.
+ */
+//public class JobLoggerListener implements JobExecutionListener {
+public class JobLoggerListener {
+
+    private static final String START_MESSAGE = "%s is beginning execution";
+    private static final String END_MESSAGE = "%s has completed with the status %s";
+
+//    @Override
+    @BeforeJob
+    public void beforeJob(JobExecution jobExecution) {
+        System.out.println(
+            String.format(START_MESSAGE, jobExecution.getJobInstance().getJobName()));
+    }
+
+//    @Override
+    @AfterJob
+    public void afterJob(JobExecution jobExecution) {
+        System.out.println(String.format(END_MESSAGE, jobExecution.getJobInstance().getJobName(),
+            jobExecution.getStatus()));
+    }
+}
+```
+- 인터페이스를 구현하는 방식과 애노테이션을 사용하는 방식 2가지를 지원한다.
+
+```java
+@Bean
+public Job job() {
+    return this.jobBuilderFactory.get("basicJob")
+        .start(step1())
+        .listener(new JobLoggerListener()) // interface 기반 listener 추가
+        .listener(JobListenerFactoryBean.getListener(new JobLoggerListener())) // 애노테이션 기반 listener 추가
+        .build();
+}
+```
+
+## ExecutionContext
+- 배치 처리 특성상 상태를 가지고 있다.
+  - 어떤 스텝이 실행중인지, 스텝이 처리한 레코드 개수는 몇개 인지, 도중에 멈췄다면 어디서 부터 재시작 해야하는지..
+- **JobExecution** 은 실제 잡 실행 시도를 나타낸다.
+  - 이는 잡이나 스텝이 진행될 때 변경된다.
+- 잡의 상태는 JobExecution 의 **ExecutionContext** 에 저장된다.
+- 웹 애플리케이션이 HttpSession 사용해 상태를 저장한다면, ExecutionContext 는 이에 대응하는 배치 잡의 세션이다.
+  - key/value 쌍을 보관하는 일종의 저장소
+- ExecutionContext 는 잡의 상태를 **안전하게 보관하는 방법** 을 제공하며, 세션과의 차이는 잡을 다루는 과정에서 ExecutionContext 가 **여러개 존재 할 수 있다.** 는 점이다.
+- JobExecution 와 마찬가지로 StepExecution 도 ExecutionContext 를 가진다.
+
+> ExecutionContext 가 가지고 있는 모든 것은 JobRepository 에 저장되기 때문에 **안전하게 보관하는 방법** 을 제공한다고 표현한다.
+
+### ExecutionContext 조작하기
+
+```java
+public class HelloWorld implements Tasklet {
+
+    private static final String HELLO_WORLD = "Hello, %s";
+
+    /**
+     * ExecutionContext 에 저장되는 모든 데이터는 JobRepository 에 저장된다.
+     * @param step
+     * @param context
+     * @return
+     * @throws Exception
+     */
+    @Override
+    public RepeatStatus execute(StepContribution step, ChunkContext context) throws Exception {
+        String name = (String) context.getStepContext()
+            .getJobParameters()
+            .get("name");
+
+        ExecutionContext jobContext = context.getStepContext()
+            // .getJobExecutionContext() // 여기서 꺼낸 Context 로도 접근이 가능하지만 이는 READ-ONLY 임에 유의
+            .getStepExecution()
+            .getJobExecution()
+            .getExecutionContext();
+
+        jobContext.put("user.name", name);
+        System.out.println(String.format(HELLO_WORLD, name));
+        return RepeatStatus.FINISHED;
+    }
+}
+```
+- ExecutionContext 는 Job 또는 StepExecution 의 이루이기 때문에 JobExecution/StepExecution 을 통해 가져와야 한다.
+- 여기서 한가지 주의할점은, 반드시 **Job/StepExecution 을 얻어온 후 ExecutionContext 에 접근해야한다.**
+  - Job/StepContext 에서 다이렉트로 얻어온 ExecutionContext 는 **READ-ONLY (정확히는 휘발성)** 이기 때문에 오류 발생시 해당 내용이 소멸된다.
+
+`StepExecution 의 Context 를 JobExecution 의 Context 로 승격`
+- 정확히는 StepExecution 에 존재하는 Key 를 JobExecution 의 Key 로 승격하는 방법이다.
+  - 이렇게 하면 StepExecution 에서도 JobExecution 의 ExecutionContext 를 조작할 수 있다.
+
+```java
+/**
+ * JobExecution 의 Execution Context 를 조작하는 또 다른 방법
+ * > StepExecution 의 Execution Context 의 키를 JobExecution 의 Execution Context 로 승격시키는 방법
+ * 스탭간의 공유할 데이터가 있지만, 첫 번째 스탭이 성공후 공유하고 싶다거나 할 때 유용하다.
+ *
+ * 또 다른 방법은 ItemStream 인터페이스를 사용하는 방법
+ */
+@Bean
+public StepExecutionListener promotionListener() {
+    /**
+     * name 키를 찾으면 JobExecution 의 ExecutionContext 로 복사한다.
+     * name 키가 없어도 아무일도 일어나지 않지만, 예외가 발생하도록 구성도 가능하다.
+     */
+    ExecutionContextPromotionListener listener = new ExecutionContextPromotionListener();
+    listener.setKeys(new String[] {"name"});
+    return listener;
+}
+```
+
+### ExecutionContext 저장하기
+- 잡이 처리되는 동안 스프링 배치는 청크를 커밋하면서 잡 또는 스탭의 상태를 저장한다.
+  - 정확히 말하면 잡과 스탭의 현재 ExecutionContext 를 데이터베이스에 저장한다.
+  - BATCH_JOB_EXECUTION_CONTEXT 테이블
+
+## 스탭 알아보기
+- 잡이 전체적인 처리를 **정의** 하는 거라면, 스탭은 **잡의 구성 요소** 를 담당한다.
+- 스탭은 **독립적 이고, 순차적으로 배치처리를 수행** 한다.
+  - 스탭을 **배치 프로세서** 라고도 표현한다.
+- 스탭은 모든 단위의 작업 조각이며, 자체적인 입력처리 및 처리기를 가질 수 있으며 자체적인 출력을 처리한다.
+- 트랜잭션은 스탭내에서 이뤄지고, 스탭은 서로 **독립되도록 설계** 되었다.
+
+### 태스크릿과 청크
+- 배치작업은 단순한 작업 또는 대량의 데이터를 처리하는 작업일 수 있다.
+- 스프링 배치는 두 가지 유형의 처리 모델을 모두 지원한다.
+
+`Tasklet`
+- 지금까지 살펴보았던 예제에 존재하는 가장 단순한 모델
+- Tasklet 인터페이스 이용해 손쉽게 구현할 수 있다.
+  - execute 메소드가 RepeatStatus.FINISHED 를 반환할 때 까지 트랜잭션 범위내에서 반복적으로 실행하는 코드블록을 만들 수 있다.
+
+```java
+public interface Tasklet {
+    @Nullable
+    RepeatStatus execute(StepContribution var1, ChunkContext var2) throws Exception;
+}
+```
+
+`Chunk`
+- 청크 기반 모델은 최소 2 ~ 3 개의 주요 컴포넌트로 구성된다.
+  - ItemReader
+  - ItemProcessor (Optional)
+  - ItemWriter
+- 각 청크는 자체 트랜잭션으로 실행되며, 처리에 실패했을 경우 마지막으로 성공한 트랜잭션 이후부터 재시작 할 수 있다.
+- 위에서 언급한 3가지 컴포넌트를 사용하면 스프링 배치는 3가지 루프를 수행한다.
+- **ItemReader**
+  - 청크 단위로 처리할 모든 레코드를 반복저긍로 메모리에 읽어온다.
+- **ItemProcessor**
+  - 메모리로 읽어들인 아이템들이 Processor 를 거쳐 처리된다.
+- **ItemWriter**
+  - 마지막으로 한번에 기록할 수 잇는 ItemWriter 를 호출하며 모든 아이템을 전달한다.
+  - 이는 물리적인 쓰기를 일괄처리하몀으로써 I/O 최적화를 수행한다.
+
+### 스탭 구성
+
+`태스크릿 스탭`
+- 태스크릿 스탭을 만드는 방법은 크게 두가지 방법이 있다.
+- Tasklet 인터페이스를 구현 / 또는 별개로 정의한 클래스를 태스크릿 스탭처럼 실행 되도록 하는 방법 (MethodInvokingTaskletAdapter)
+- 그외에도 여러 방법이 존재하는데 하나씩 살펴본다.
+
+`CallableTaskletAdapter`
+- java.util.concurrent.Callable<RepeatStatus> 인터페이스의 구현체를 구성할 수 있게 해주는 어댑터
+  - 별개의 스레드에서 실행되긴 하지만, **병렬로 실행되지는 않는다.**
+- 유효한 RepeatStatus 를 반환하기 전까지는 완료된 것으로 간주되지 않는다.
+
+```java
+/**
+ * CallableTasklet 은 별개의 스레드에서 실행되지만, **병렬로 실행되지는 않는다.**
+ */
+@EnableBatchProcessing
+@SpringBootApplication
+public class CallableTaskletConfiguration {
+
+  @Autowired
+  private JobBuilderFactory jobBuilderFactory;
+
+  @Autowired
+  private StepBuilderFactory stepBuilderFactory;
+
+  @Bean
+  public Job callableJob() {
+    return this.jobBuilderFactory.get("callableJob")
+            .start(callableStep())
+            .build();
+  }
+
+  @Bean
+  public Step callableStep() {
+    return this.stepBuilderFactory.get("callableStep")
+            .tasklet(tasklet())
+            .build();
+  }
+
+  @Bean
+  public Callable<RepeatStatus> callableObject() {
+    return () -> {
+      System.out.println("This wa executed in another thread");
+      return RepeatStatus.FINISHED;
+    };
+  }
+
+  @Bean
+  public CallableTaskletAdapter tasklet() {
+    CallableTaskletAdapter adapter = new CallableTaskletAdapter();
+    adapter.setCallable(callableObject());
+    return adapter;
+  }
+
+  public static void main(String[] args) {
+    SpringApplication.run(CallableTaskletConfiguration.class, args);
+  }
+}
+```
+
+`MethodInvokingTaskletAdapter`
+- 기존의 달느 클래스를 잡 의 태스크릿처럼 실행할 수 있다.
+- Tasklet 인터페이스를 구현하는 대신 이를 이용해 해당 메소드를 호출할 수 있다.
+- Late Binding 을 통해 파라메터를 전달할 수도 있음
+
+```java
+@EnableBatchProcessing
+@SpringBootApplication
+public class MethodInvokingTaskletConfiguration {
+
+    @Autowired
+    private JobBuilderFactory jobBuilderFactory;
+
+    @Autowired
+    private StepBuilderFactory stepBuilderFactory;
+
+    @Bean
+    public Job methodInvokingJob() {
+        return this.jobBuilderFactory.get("methodInvokingJob")
+            .start(methodInvokingStep())
+            .build();
+    }
+
+    @Bean
+    public Step methodInvokingStep() {
+        return this.stepBuilderFactory.get("methodInvokingStep")
+            .tasklet(methodInvokingTasklet(null))
+            .build();
+    }
+
+    /**
+     * TargetObject 의 메소드가 ExitStatus 를 반환하지 않는다면, ExitStatus.COMPLETED 를 반환한다.
+     */
+    @StepScope
+    @Bean
+    public MethodInvokingTaskletAdapter methodInvokingTasklet(
+        @Value("#{jobParameters['message']}") String message
+    ) {
+        MethodInvokingTaskletAdapter adapter = new MethodInvokingTaskletAdapter();
+        adapter.setTargetObject(service());
+        adapter.setTargetMethod("serviceMethod");
+        adapter.setArguments(new String[] {message});
+        return adapter;
+    }
+
+    @Bean
+    public CustomerService service() {
+        return new CustomerService();
+    }
+
+    static class CustomerService {
+
+        public void serviceMethod(String message) {
+            System.out.println(String.format("Service method was called... message = %s", message));
+        }
+    }
+
+    public static void main(String[] args) {
+        SpringApplication.run(MethodInvokingTaskletConfiguration.class, args);
+    }
+}
+```
+
+`SystemCommandTasklet`
+- 시스템 명령을 실행할 때 사용한다.
+- 해당 명령은 **비동기로 실행** 된다.
+  - 타임아웃을 지정할 수 있으며,  이는 밀리초 단위이다.
+- interruptOnCancel 속성은 잡이 비정상 종료되었을때, 해당 프로세스 관련 스레드를 강제 종료할 것인지 여부이다.
+
+```java
+/**
+ * 시스템 명령 실행시 사용된다. (비동기로 실행됨)
+ */
+@EnableBatchProcessing
+@SpringBootApplication
+public class SystemCommandTaskletConfiguration {
+
+    @Autowired
+    private JobBuilderFactory jobBuilderFactory;
+
+    @Autowired
+    private StepBuilderFactory stepBuilderFactory;
+
+    @Bean
+    public Job job() {
+        return this.jobBuilderFactory.get("systemCommandJob")
+            .start(systemCommandStep())
+            .build();
+    }
+
+    @Bean
+    public Step systemCommandStep() {
+        return this.stepBuilderFactory.get("systemCommandStep")
+            .tasklet(systemCommandTasklet())
+            .build();
+    }
+
+    @Bean
+    public SystemCommandTasklet  systemCommandTasklet() {
+        SystemCommandTasklet tasklet = new SystemCommandTasklet();
+
+        tasklet.setCommand("echo hello world!");
+        tasklet.setTimeout(5_000);
+        // interruptOnCancel 애트리뷰트 사용 여부는 선택사항
+        // 잡이 비정상적 종료시 시스템 프로세스 관련 스레드를 강제로 종료할 것인지 지정
+        tasklet.setInterruptOnCancel(true);
+
+        // 시스템 명령 실행시 영향을 주는 파라미터 옵션
+
+        // 명령을 실행할 디렉터리
+        tasklet.setWorkingDirectory("/Users/kakaocommerce/work/Spring-Batch-Study/Chapter04");
+
+        // 시스템 코드는 실행 명령에 따라 다른 의미를 가질 수 있다.
+        // 시스템 코드를 스프링 배치 상태 값으로 매핑 가능한 구현체를 지정할 수 있다.
+        // 기본적으로 두가지 구현체를 제공한다.
+        tasklet.setSystemProcessExitCodeMapper(touchCodeMapper());
+
+        // 시스템 명령은 기본적으로 비동기로 실행된다.
+        // 명령 실행후 테스크릿이 완료 여부를 주기적으로 확인함. 해당 주기 설정 (기본값 1초)
+        tasklet.setTerminationCheckInterval(5_000);
+
+        // 시스템 명령을 실행하는 고유한 실행기 구성
+        // 문제발생시 락이 걸릴수 있기 때문에 동기식은 구성하지 않는것이 좋음
+        tasklet.setTaskExecutor(new SimpleAsyncTaskExecutor());
+
+        // 명령 실행전 적용할 환경 파라미터들 ..
+        tasklet.setEnvironmentParams(new String[] {
+//            "JAVA_HOME=/java",
+//            "BATCH_HOME=/Users/batch"
+        });
+        return tasklet;
+    }
+
+    @Bean
+    public SimpleSystemProcessExitCodeMapper touchCodeMapper() {
+        return new SimpleSystemProcessExitCodeMapper();
+    }
+
+    public static void main(String[] args) {
+        SpringApplication.run(SystemCommandTaskletConfiguration.class, args);
+    }
+}
+```
+
+`청크 스탭`
+- 청크는 커밋 간격 (Commit Interval) 에 의해 정의 된다.
+- 만약 커밋 간격을 50으로 지정했다면, 50개를 읽고, 50개를 처리 한후 50개를 기록한다.
+
+```java
+@EnableBatchProcessing
+@SpringBootApplication
+public class ChunkBatchConfiguration {
+
+  @Autowired
+  private JobBuilderFactory jobBuilderFactory;
+
+  @Autowired
+  private StepBuilderFactory stepBuilderFactory;
+
+  @Bean
+  public Job job() {
+    return this.jobBuilderFactory.get("job")
+            .start(step1())
+            .build();
+  }
+
+  @Bean
+  public Step step1() {
+    return this.stepBuilderFactory.get("step1")
+            .<String, String>chunk(10) // 10개 단위로 레코드 처리후 작업이 커밋됨
+            .reader(itemReader(null))
+            .writer(itemWriter(null))
+            .build();
+  }
+
+  @StepScope
+  @Bean
+  public FlatFileItemReader<String> itemReader(
+          @Value("#{jobParameters['inputFile']}") Resource inputFile
+  ) {
+    return new FlatFileItemReaderBuilder<String>()
+            .name("itemReader")
+            .resource(inputFile)
+            .lineMapper(new PassThroughLineMapper())
+            .build();
+  }
+
+  @StepScope
+  @Bean
+  public FlatFileItemWriter<String> itemWriter(
+          @Value("#{jobParameters['outputFile']}") Resource outputFile
+  ) {
+    return new FlatFileItemWriterBuilder<String>()
+            .name("itemWriter")
+            .resource(outputFile)
+            .lineAggregator(new PassThroughLineAggregator<>())
+            .build();
+  }
+
+}
+```
+- 위 예제에서는 10개 단위로 청크사이즈를 지정하였으며, 청크 기반 스탭은, build 메소드 호출 이전에 리더 및 라이터의 구현체를 가져온다.
+- 적절한 커밋 간격을 지정하는 것이 중요하다.
+- 10개의 레코드를 읽고, 처리할때 까지 레코드 쓰기 작업을 진행하지 않는다는 것을 의미한다.
+- 만약 9개를 처리한 후 오류가 발생했다면, 청크 (트랜잭션) 을 롤백처리하고, 잡이 실패했다고 마킹한다.
+
+`청크 크기 구성`
+- 청크 기반처리는 스프링 배치의 토대가 된다.
+- 이를 최대한 활용하기 위해 다양한 구성 방법에 대한 이해가 중요하다.
+- 청크 크기를 구성하는 방식은 **정적인 방식** 과 **CompletionPolicy** 구현체 활용 방법 두가지가 있다. 
+
+`CompletionPolicy`
+- 청크가 완료되는 시점을 프로그래밍 방식으로 정의할 수 있는 기능을 제공하며, 많은 구현체를 제공한다.
+- 그 중 많이 사용되는 **SimpleCompletionPolicy** 와 **TimeoutTerminationPolicy** 가 있다.
+- SimpleCompletionPolicy
+  - 아이템 갯수 기반으로 동작한다.
+  - 지정한 아이템 갯수의 임계값 ex) 1000 을 넘어서면 청크 완료로 표시한다.
+- TimeoutTerminationPolicy
+  - 시간을 기반으로 동작한다.
+  - 지정한 시간의 임계값 ex) 3 을 넘어서면 청크 완료로 표시한다.
+
+```java
+public interface CompletionPolicy {
+    boolean isComplete(RepeatContext var1, RepeatStatus var2);
+
+    boolean isComplete(RepeatContext var1);
+
+    RepeatContext start(RepeatContext var1);
+
+    void update(RepeatContext var1);
+}
+```
+
+```java
+@EnableBatchProcessing
+@SpringBootApplication
+public class ChunkBasedJobConfiguration {
+
+    @Autowired
+    private JobBuilderFactory jobBuilderFactory;
+
+    @Autowired
+    private StepBuilderFactory stepBuilderFactory;
+
+    @Bean
+    public Job chunkBasedJob() {
+        return this.jobBuilderFactory.get("chunkBasedJob")
+            .start(chunkStep())
+            .build();
+    }
+
+    /**
+     * 동적인 Chunk 사이즈 조절을 위한 CompletionPolicy 인터페이스를 제공해준다.
+     * 기본 구현체는 SimpleCompletionPolicy -> 처리된 아이템 갯수를 이용해 임계값에 도달하면 완료 처리
+     * TimeoutTerminationPolicy -> 처리시간이 임계값에 도달하면 해당 청크가 완료된 것으로 간주한다.
+     * CompositeCompletionPolicy -> 청크완료 여부를 여러 정책들을 이용해 구성 가능 (자신이 가진 정책중 하나라도 만족하면 완료처리)
+     */
+    @Bean
+    public Step chunkStep() {
+        return this.stepBuilderFactory.get("chunkStep")
+            // .<String, String>chunk(1_000) // 일반적으로 청크사이즈를 하드코딩하지만 모든 상황에 적절한 것은 아니다.
+//            .<String, String>chunk(completionPolicy())
+            .<String, String>chunk(randomCompletionPolicy())
+            .reader(itemReader())
+            .writer(itemWriter())
+            .listener(new LoggingStepStartStopListener())
+            .build();
+    }
+
+    @Bean
+    public ListItemReader<String> itemReader() {
+        List<String> items = new ArrayList<>(100_000);
+
+        for (int i = 0; i < 100_000; i++) {
+            items.add(UUID.randomUUID().toString());
+        }
+
+        return new ListItemReader<>(items);
+    }
+
+    @Bean
+    public ItemWriter<String> itemWriter() {
+        return items -> {
+            for (String item : items) {
+                System.out.println(">> current item = " + item);
+            }
+        };
+    }
+
+    @Bean
+    public CompletionPolicy completionPolicy() {
+        CompositeCompletionPolicy policy = new CompositeCompletionPolicy();
+        policy.setPolicies(
+            new CompletionPolicy[]{
+                new TimeoutTerminationPolicy(3),
+                new SimpleCompletionPolicy(1_000)
+            }
+        );
+        return policy;
+    }
+
+    @Bean
+    public CompletionPolicy randomCompletionPolicy() {
+        return new RandomChunkSizePolicy();
+    }
+
+    public static void main(String[] args) {
+        SpringApplication.run(ChunkBasedJobConfiguration.class, args);
+    }
+}
+```
+- 위 예제에서 CompositeCompletionPolicy 를 사용하였다.
+- 이는 여러 CompletionPolicy 를 조합해서 사용할 수 있도록 제공한다.
+- 여러 정책중 하나라도 완료되었다고 판단되면 해당 청크가 완료된것으로 간주한다.
+
+`RandomChunkSizePolicy`
+- CompletionPolicy 를 직접 구현해서 사용할 수 도 있다.
+- 다음 은 랜덤하게 청크 크기를 지정하도록 작성한 예시이다.
+
+```java
+public class RandomChunkSizePolicy implements CompletionPolicy {
+
+    private int chunkSize;
+    private int totalProcessed;
+    private Random random = new Random();
+
+    @Override
+    public boolean isComplete(RepeatContext repeatContext, RepeatStatus repeatStatus) {
+        if (RepeatStatus.FINISHED == repeatStatus) {
+            return true;
+        }
+        return isComplete(repeatContext);
+    }
+
+    @Override
+    public boolean isComplete(RepeatContext repeatContext) {
+        return this.totalProcessed >= chunkSize;
+    }
+
+    @Override
+    public RepeatContext start(RepeatContext repeatContext) {
+        this.chunkSize = random.nextInt(20);
+        this.totalProcessed = 0;
+
+        System.out.println("The Chunk Size has been set to " + this.chunkSize);
+        return repeatContext;
+    }
+
+    @Override
+    public void update(RepeatContext repeatContext) {
+        this.totalProcessed++;
+    }
+}
+```
+
+### 스텝 리스너
+- 잡 리스너와 동일하게 스탭도 동일한 유형의 이벤트를 처리할 수 있다.
+- StepExecutionListener 와 ChunkListener 인터페이스가 존재한다.
+- 각 인터페이스는 스텝/청크 의 시작과 끝에서 특정 로직을 수행할 수 있게 해준다.
+
+```java
+public interface StepExecutionListener extends StepListener {
+  void beforeStep(StepExecution var1);
+
+  @Nullable
+  ExitStatus afterStep(StepExecution var1);
+}
+
+public interface ChunkListener extends StepListener {
+    String ROLLBACK_EXCEPTION_KEY = "sb_rollback_exception";
+
+    void beforeChunk(ChunkContext var1);
+
+    void afterChunk(ChunkContext var1);
+
+    void afterChunkError(ChunkContext var1);
+}
+```
+
+> 주의할 점은 스탭 관련 리스너는 **StepExecutionListener** 라는 점, StepListener 라는 인터페이스가 별도로 존재하긴 하지만, 이는 모든 스탭리스너가 상속받는 **마커인터페이스** 이다.
+
+```java
+public class LoggingStepStartStopListener implements StepExecutionListener {
+
+    @Override
+    public void beforeStep(StepExecution stepExecution) {
+        System.out.println(stepExecution.getStepName() + " has begun!");
+    }
+
+    @Override
+    public ExitStatus afterStep(StepExecution stepExecution) {
+        System.out.println(stepExecution.getStepName() + " has ended!");
+        return stepExecution.getExitStatus();
+    }
+}
+```
+- 잡 리스너와 마찬가지로 위와 같이 인터페이스를 구현하는 방식, 그리고 @BeforeStep, @AfterStep 과 같은 애노테이션 방식을 지원한다.
+
+## 스텝 플로우
+- 지금 까지는 각 스텝을 줄을 세워 **순서대로 실행** 했다.
+- 하지만 이런 방식으로만 스텝을 사용할 수 있다면 배치 사용방법은 매우 제한적일 것이다.
+- 스프링 배치는 잡의 흐름을 커스터마이징 할 수 있는 여러 방법을 제공한다.
+
+### 조건 로직
+- 스프링 배치의 스탭은 잡 내에서 StepBuilder 의 next 메소드를 사용해 지정한 순대로 실행한다.
+- 스탭을 다른 순서로 실행하는것도 쉬운데, **전이 (transition)** 을 구성하면 된다.
+
+```java
+@Bean
+public Tasklet passTasklet() {
+    return (stepContribution, chunkContext) -> RepeatStatus.FINISHED;
+}
+
+@Bean
+public Tasklet successTasklet() {
+  return (stepContribution, chunkContext) -> {
+    System.out.println("Success!");
+    return RepeatStatus.FINISHED;
+  };
+}
+
+@Bean
+public Tasklet failTasklet() {
+    return (stepContribution, chunkContext) -> {
+        System.out.println("Failure!");
+        return RepeatStatus.FINISHED;
+    };
+}
+
+@Bean
+public Step firstStep() {
+    return this.stepBuilderFactory.get("firstStep")
+      .tasklet(passTasklet())
+      .build();
+}
+
+@Bean
+public Step successStep() {
+    return this.stepBuilderFactory.get("successStep")
+      .tasklet(successTasklet())
+      .build();
+}
+
+@Bean
+public Step failureStep() {
+    return this.stepBuilderFactory.get("failureStep")
+      .tasklet(failTasklet())
+      .build();
+}
+
+@Bean
+public Job job() {
+    // pattern matching 을 지원함
+    // ExitStatus 는 **문자열** 이기 때문에 패턴 매칭을 통해 여러 상태로 매칭할 수 있다.
+    // ex) C* -> COMPLETE, CORRECT
+    return this.jobBuilderFactory.get("conditionalJob")
+        .start(firstStep())
+        .on("FAILED").to(failureStep())
+        .from(firstStep()).on("*").to(successStep()) // 성공할 경우 successStep
+        .end()
+        .build();
+}
+```
+- 위 잡 구성은, firstStep 의 실행결과가 FAILED 라면 failureStep 을, 성공했다면 successStep 을 실행하도록 전이를 구성한 예이다.
+- on() 메소드는 스프링 배치가 스탭의 ExitStatus 를 평가해 어떤 작업을 수행할지 결정하도록 구성하는 메소드이다.
+
+`BatchStatus 와 ExitStatus`
+- BatchStatus 는 잡이나 스텝의 **현재 상태를 식별** 하는 Job/StepExecution 의 속성이다.
+- ExitStatus 는 잡이나 스텝 종료시 스프링 배치로 반환되는 값이다.
+- 스프링 배치는, 이후에 어떤 스텝을 수행할지 결정할 때 **ExitStatus** 를 확인한다.
+- ExitStatus 는 문자열 이기 때문에 와일드 카드를 통해 패턴 매칭이 가능하다.
+  - *, ? 두개의 와일드 카드를 지원한다.
+  - * : 0 개 이상의 문자를 일치 ex) C* = C, COMPLETE, CORRECT
+  - ? : 1개 의 문자를 일치 ex) ?AT = CAT, KAT
+
+> ExitStatus 만으로는 현재 스탭에서 특정 레코드를 스킵했을때 특정 스탭을 실행하지 않는다거나 이런 구성을 하기엔 제한적이다.
+
+`JobExecutionDecider`
+- ExitStatus 만으로 판단하기 힘든 전이상태를 프로그래밍 적으로 작성할 수 있게 지원하는 인터페이스 이다.
+
+```java
+public interface JobExecutionDecider {
+    FlowExecutionStatus decide(JobExecution var1, @Nullable StepExecution var2);
+}
+
+public class RandomDecider implements JobExecutionDecider {
+
+  private Random random = new Random();
+
+  @Override
+  public FlowExecutionStatus decide(JobExecution jobExecution, StepExecution stepExecution) {
+
+    if (random.nextBoolean()) {
+      return new FlowExecutionStatus(FlowExecutionStatus.COMPLETED.getName());
+    }
+    return new FlowExecutionStatus(FlowExecutionStatus.FAILED.getName());
+  }
+}
+```
+
+```java
+@EnableBatchProcessing
+@SpringBootApplication
+public class ConditionalJobConfiguration {
+
+    @Autowired
+    private JobBuilderFactory jobBuilderFactory;
+
+    @Autowired
+    private StepBuilderFactory stepBuilderFactory;
+
+    @Bean
+    public Tasklet passTasklet() {
+        return (stepContribution, chunkContext) -> RepeatStatus.FINISHED;
+    }
+
+    @Bean
+    public Tasklet successTasklet() {
+        return (stepContribution, chunkContext) -> {
+            System.out.println("Success!");
+            return RepeatStatus.FINISHED;
+        };
+    }
+
+    @Bean
+    public Tasklet failTasklet() {
+        return (stepContribution, chunkContext) -> {
+            System.out.println("Failure!");
+            return RepeatStatus.FINISHED;
+        };
+    }
+
+    /**
+     * ExitStatus 를 이용해 다음에 어떤 스탭을 실행할 지 결정하게 할 수 있다. 하지만 이만으론 부족할때가 있음 특정 레코드를 건너뛰었다면 특정 스탭을 실행하지
+     * 않게 한다거나 ... 이를 위해 JobExecutionDecider 인터페이스를 제공한다.
+     */
+    @Bean
+    public Job job() {
+        // pattern matching 을 지원함
+        // ExitStatus 는 **문자열** 이기 때문에 패턴 매칭을 통해 여러 상태로 매칭할 수 있다.
+        // ex) C* -> COMPLETE, CORRECT
+        return this.jobBuilderFactory.get("conditionalJob")
+            .start(firstStep())
+            .next(decider())
+            .from(decider())
+            .on("FAILED")
+//            .fail() // 실패시 FAIL 상태로 기록 / 동일한 잡으로 재실행 가능
+            .stopAndRestart(successStep()) // 실패시 STOPPED 상태로 기록되며 / 지정한 step 부터 재시작 된다.
+//            .to(failureStep()) // 실패할 경우 failureStep
+            .from(decider()).on("*").to(successStep()) // 성공할 경우 successStep
+            .end()
+            .build();
+    }
+
+    @Bean
+    public Step firstStep() {
+        return this.stepBuilderFactory.get("firstStep")
+            .tasklet(passTasklet())
+            .build();
+    }
+
+    @Bean
+    public Step successStep() {
+        return this.stepBuilderFactory.get("successStep")
+            .tasklet(successTasklet())
+            .build();
+    }
+
+    @Bean
+    public Step failureStep() {
+        return this.stepBuilderFactory.get("failureStep")
+            .tasklet(failTasklet())
+            .build();
+    }
+
+    @Bean
+    public JobExecutionDecider decider() {
+        return new RandomDecider();
+    }
+
+    @Bean
+    public BatchConfigurer batchConfigurer(DataSource dataSource) {
+        return new DefaultBatchConfigurer(dataSource) {
+            @Override
+            public JobLauncher getJobLauncher() {
+                return super.getJobLauncher();
+            }
+        };
+    }
+
+    public static void main(String[] args) {
+        SpringApplication.run(ConditionalJobConfiguration.class, args);
+    }
+}
+```
+
+### 잡 종료하기
+- 스프링 배치에서 잡을 프로그래밍적으로 종료하려면 아래 세가지 상태로 종료할 수 있다.
+- Completed
+  - 스프링 배치가 성공적으로 종료됨
+  - 동일한 파라미터로 재실행할 수 없다.
+- Failed
+  - 잡이 성공적으로 완료되지 않음
+  - 스프링 배치를 사용해 동일한 파라미터로 재실행 할 수 있다.
+- Stopped
+  - 재실행할 수 있다.
+  - 잡에 오류가 발생하지 않았지만 중단된 위치에서 잡을 다시 실행할 수 있다.
+  - 스탭 사이에 사람의 개입이 필요하거나 검사 및 처리가 필요한 경우 유용하다.
+
+> ExitStatus 는 스탭, 청크, 잡에서 반환 될 수 있으며 JobRepository 에 저장할 BatchStatus 를 판단할 때 이를 활용한다.
+
+- Completed, Failed 상태는 각각 end(), fail() 메소드로 해당 상태를 반환할 수 있는데, stopped 상태는 조금 특이하다.
+  - stopAndRestart 메소드를 통해 재시작시 지정한 스탭부터 진행하게 된다.
+
+```java
+    @Bean
+    public Job job() {
+        // pattern matching 을 지원함
+        // ExitStatus 는 **문자열** 이기 때문에 패턴 매칭을 통해 여러 상태로 매칭할 수 있다.
+        // ex) C* -> COMPLETE, CORRECT
+        return this.jobBuilderFactory.get("conditionalJob")
+            .start(firstStep())
+            .next(decider())
+            .from(decider())
+            .on("FAILED")
+//            .fail() // 실패시 FAIL 상태로 기록 / 동일한 잡으로 재실행 가능
+            .stopAndRestart(successStep()) // 실패시 STOPPED 상태로 기록되며 / 지정한 step 부터 재시작 된다.
+//            .to(failureStep()) // 실패할 경우 failureStep
+            .from(decider()).on("*").to(successStep()) // 성공할 경우 successStep
+            .end()
+            .build();
+    }
+```
+
+### 플로우 외부화 하기
+- 스프링 배치에서 스탭의 순서를 외부화 하는 방법은 세 가지 이다.
+1. 스탭의 시퀀스를 독자적인 플로우로 만드는 방법
+2. 플로우 스탭을 사용하는 방법
+3. 잡내에서 다른 잡을 호출하는 방법
+
+`플로우 정의`
+
+```java
+@EnableBatchProcessing
+@SpringBootApplication
+public class FlowJob {
+
+    @Autowired
+    private JobBuilderFactory jobBuilderFactory;
+
+    @Autowired
+    private StepBuilderFactory stepBuilderFactory;
+
+    @Bean
+    public Tasklet loadStockFile() {
+        return (contribution, chunkContext) -> {
+            System.out.println("The stock file has been loaded");
+            return RepeatStatus.FINISHED;
+        };
+    }
+
+    @Bean
+    public Tasklet loadCustomerFile() {
+        return (contribution, chunkContext) -> {
+            System.out.println("The customer file has been loaded");
+            return RepeatStatus.FINISHED;
+        };
+    }
+
+    @Bean
+    public Tasklet updateStart() {
+        return (contribution, chunkContext) -> {
+            System.out.println("The start has been updated");
+            return RepeatStatus.FINISHED;
+        };
+    }
+
+    @Bean
+    public Tasklet runBatchTasklet() {
+        return (contribution, chunkContext) -> {
+            System.out.println("The batch file has been run");
+            return RepeatStatus.FINISHED;
+        };
+    }
+
+    @Bean
+    public Step loadFileStep() {
+        return this.stepBuilderFactory.get("loadFileStep")
+            .tasklet(loadStockFile())
+            .build();
+    }
+
+    @Bean
+    public Step loadCustomerStep() {
+        return this.stepBuilderFactory.get("loadCustomerStep")
+            .tasklet(loadCustomerFile())
+            .build();
+    }
+
+    @Bean
+    public Step updateStartStep() {
+        return this.stepBuilderFactory.get("updateStartStep")
+            .tasklet(updateStart())
+            .build();
+    }
+
+    @Bean
+    public Step runBatch() {
+        return this.stepBuilderFactory.get("runBatch")
+            .tasklet(runBatchTasklet())
+            .build();
+    }
+
+    @Bean
+    public Flow preProcessingFlow() {
+        return new FlowBuilder<Flow>("preProcessingFlow").start(loadFileStep())
+            .next(loadCustomerStep())
+            .next(updateStartStep())
+            .build();
+    }
+
+    @Bean
+    public Job conditionalStepLogicJob() {
+        return this.jobBuilderFactory.get("conditionalStepLogicJob")
+            .start(preProcessingFlow())
+            .next(runBatch())
+            .end()
+            .build();
+    }
+
+    public static void main(String[] args) {
+        SpringApplication.run(FlowJob.class, args);
+    }
+}
+```
+- 플로우는 잡과 비슷한 방식으로 구성한다.
+- 이를 실행한 뒤 JobRepository 를 보면 플로우의 스탭이 잡의 일부분으로 저장되어 있는걸 확인할 수 있다.
+- 결과적으로는 플로우를 사용하는것과 잡 내에서 스탭을 직접 구성하는 것에는 차이는 없다.
+
+`플로우 스탭`
+- 위와 플로우의 구성은 동일하지만, 플로우를 잡 빌더로 전달하지 않고 해당 **플로우를 스탭으로 래핑한뒤 해당 스탭을 잡으로 전달** 한다.
+
+```java
+/**
+ * FlowStep
+ * 플로우를 스탭으로 래핑한 뒤 잡으로 전달한다.
+ */
+@Bean
+public Step initBatch() {
+    return this.stepBuilderFactory.get("initBatch")
+        .flow(preProcessingFlow())
+        .build();
+}
+@Bean
+public Job conditionalStepLogicJob() {
+    return this.jobBuilderFactory.get("conditionalStepLogicJob")
+//            .start(preProcessingFlow()) // 플로우 방식
+    .start(initBatch()) // 스탭 플로우 방식
+    .next(runBatch())
+//            .end()
+    .build();
+}
+```
+- 플로우 스탭을 사용하면, 플로우가 담긴 스탭을 **하나의 스탭처럼 기록** 한다.
+- 이는 모니터링 과 리포팅에 이점이 있다.
+- 개별 스탭을 집계하지 않아도 플로우의 영향을 전체적으로 볼 수 있다.
+
+`잡 스탭`
+- 스탭을 전혀 외부화하지 않는 방식
+- 플로우를 작성하는 대신 **잡에서 다른 잡을 호출** 한다.
+
+```java
+@EnableBatchProcessing
+@SpringBootApplication
+public class JobJob {
+
+
+    @Autowired
+    private JobBuilderFactory jobBuilderFactory;
+
+    @Autowired
+    private StepBuilderFactory stepBuilderFactory;
+
+    @Bean
+    public Tasklet loadStockFile() {
+        return (contribution, chunkContext) -> {
+            System.out.println("The stock file has been loaded");
+            return RepeatStatus.FINISHED;
+        };
+    }
+
+    @Bean
+    public Tasklet loadCustomerFile() {
+        return (contribution, chunkContext) -> {
+            System.out.println("The customer file has been loaded");
+            return RepeatStatus.FINISHED;
+        };
+    }
+
+    @Bean
+    public Tasklet updateStart() {
+        return (contribution, chunkContext) -> {
+            System.out.println("The start has been updated");
+            return RepeatStatus.FINISHED;
+        };
+    }
+
+    @Bean
+    public Tasklet runBatchTasklet() {
+        return (contribution, chunkContext) -> {
+            System.out.println("The batch file has been run");
+            return RepeatStatus.FINISHED;
+        };
+    }
+
+    @Bean
+    public Step loadFileStep() {
+        return this.stepBuilderFactory.get("loadFileStep")
+            .tasklet(loadStockFile())
+            .build();
+    }
+
+    @Bean
+    public Step loadCustomerStep() {
+        return this.stepBuilderFactory.get("loadCustomerStep")
+            .tasklet(loadCustomerFile())
+            .build();
+    }
+
+    @Bean
+    public Step updateStartStep() {
+        return this.stepBuilderFactory.get("updateStartStep")
+            .tasklet(updateStart())
+            .build();
+    }
+
+    @Bean
+    public Step runBatch() {
+        return this.stepBuilderFactory.get("runBatch")
+            .tasklet(runBatchTasklet())
+            .build();
+    }
+
+    @Bean
+    public Job conditionalStepLogicJob() {
+        return this.jobBuilderFactory.get("conditionalStepLogicJob")
+            .start(initBatch())
+            .next(runBatch())
+            .build();
+    }
+
+    @Bean
+    public Job preProcessingJob() {
+        return this.jobBuilderFactory.get("preProcessingJob")
+            .start(loadFileStep())
+            .next(loadCustomerStep())
+            .next(updateStartStep())
+            .build();
+    }
+
+    /**
+     * JobStep 잡 내에서 다른 잡을 호출하게 한다.
+     */
+    @Bean
+    public Step initBatch() {
+        return this.stepBuilderFactory.get("initBatch")
+            .job(preProcessingJob())
+            .parametersExtractor(new DefaultJobParametersExtractor())
+            .build();
+    }
+
+    public static void main(String[] args) {
+        SpringApplication.run(JobJob.class, args);
+    }
+}
+```
+- 기존 잡구성과 차이점은 parametersExtractor 를 사용한다는 점
+- 잡을 구동하면 해당 잡의 이름으로 구동되고, 잡은 **잡 이름과 잡 파라미터로 식별** 된다.
+  - 잡 스탭도 JobExecutionContext 가 생성된다.
+- 사용자는 서브잡인 preProcessingJob 에 잡 파라미터를 전달하지 않고, 상위 잡에서 잡파라미터 는 ExecutionContext 를 추출해 하위잡으로 전달하는 클래스를 정의해야 한다.
+- preProcessingJob 은 다른 잡과 마찬가지로 JOB_INSTANCE 로 기록된다.
+
+> 잡스텝은 오히려 실행제어시 제약이 될 수 있다. <br/>
+> 오히려 잡 관리기능은 **단일 잡 수준** 에서 이뤄지기 때문에 잡 스탭기능을 이용해서 잡을 트리구조로 만들어 관리하면 문제가 될 수 있다.
+
+
 ## 참고
 - https://hyeonyeee.tistory.com/73
 - https://jeong-pro.tistory.com/188
