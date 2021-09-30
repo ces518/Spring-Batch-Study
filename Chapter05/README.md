@@ -284,5 +284,252 @@ public class DefaultBatchConfigurer implements BatchConfigurer {
 | setIsolationLevelForCreate | JobExecution 생성시 사용될 트랜잭션 격리 수준 / 기본은 SERIALIZABLE |
 | setTransactionManager | 복수의 데이터베이스 사용시 이를 동기화할 수 있도록 2단계 커밋을 지원하는 트랜잭션 매니저 설정 |
 
+- DefaultBatchConfigurer 를 사용하는 때는 일반적으로 **Multi DataSource** 를 사용하는 경우이다.
+  - 이런 경우에는 JobRepository 가 사용할 데이터 소스를 명시적으로 구성해야 한다.
+  
+```java
+public class CustomBatchConfigurer extends DefaultBatchConfigurer {
+
+    @Autowired
+    @Qualifier("repositoryDataSource")
+    private DataSource dataSource;
+
+    @Override
+    protected JobRepository createJobRepository() throws Exception {
+        JobRepositoryFactoryBean factoryBean = new JobRepositoryFactoryBean();
+        factoryBean.setDatabaseType(DatabaseType.MYSQL.getProductName());
+        factoryBean.setTablePrefix("FOO_");
+        factoryBean.setIsolationLevelForCreate("ISOLATION_REPEATABLE_READ");
+        factoryBean.setDataSource(dataSource);
+        factoryBean.afterPropertiesSet();
+        return factoryBean.getObject();
+    }
+}
+```
+- createJobRepository() 를 오버라이드 할때 주의할 점은, afterPropertiesSet(), getObject() 같은 **스프링 라이프사이클에 의해 Hooking 되는 메소드를 가진 인터페이스** 의 경우 해당 메소드를 직접 Trigger 해주어야 한다.
+
+### TransactionManager 커스터마이징
+
+```java
+public class CustomBatchConfigurer extends DefaultBatchConfigurer {
+
+    @Autowired
+    @Qualifier("repositoryDataSource")
+    private DataSource dataSource;
+
+    @Autowired
+    @Qualifier("batchTransactionManager")
+    private PlatformTransactionManager transactionManager;
+
+    @Override
+    public PlatformTransactionManager getTransactionManager() {
+        return transactionManager;
+    }
+
+    @Override
+    protected JobRepository createJobRepository() throws Exception {
+        JobRepositoryFactoryBean factoryBean = new JobRepositoryFactoryBean();
+        factoryBean.setDatabaseType(DatabaseType.MYSQL.getProductName());
+        factoryBean.setTablePrefix("FOO_");
+        factoryBean.setIsolationLevelForCreate("ISOLATION_REPEATABLE_READ");
+        factoryBean.setDataSource(dataSource);
+        factoryBean.afterPropertiesSet();
+        return factoryBean.getObject();
+    }
+}
+```
+- getTransactionManager 메소드를 오버라이드하면 특별히 지정해둔 트랜잭션 매니저를 사용할 수 있다.
+- 하지만 이전 예제에서는 이를 호출하지 않았는데, 그 이유는 TransactionManager 가 생성되어 있지 않다면 **setDataSource 메소드 내부에서 DataSourceTransactionManager 를 자동으로 생성** 하기 때문이다.
+
+`setDataSource.java`
+
+```java
+@Autowired(required = false)
+public void setDataSource(DataSource dataSource) {
+    if(this.dataSource == null) {
+        this.dataSource = dataSource;
+    }
+
+    if(getTransactionManager() == null) {
+        logger.warn("No transaction manager was provided, using a DataSourceTransactionManager");
+        this.transactionManager = new DataSourceTransactionManager(this.dataSource);
+    }
+}
+```
+
+### JobExplorer 커스터마이징
+- JobExplorer 는 JobRepository 에 저장된 메타데이터를 읽기 전용으로 제공해주는 인터페이스 이다.
+- 기본인 데이터 접근 계층은 JobRepository 와 공유되는 공통 DAO 집합이다.
+- 때문에 JobRepository 와 커스터마이징에 사용하는 애트리뷰트는 동일하다.
+
+`JobExplorerFactoryBean`
+
+| 접근자 명 | 설명 |
+| --- | --- |
+| setSerializer | ExecutionContext 를 직렬화할 때 사용할 **ExecutionContextSerializer* 의 구현체를 인자로 받음 |
+| setLobHandler | LOB 를 다르게 취급해야하는 Oracle 의 예전 버전 사용시 필요한 설정 |
+| setDataSource | DataSource 변경 설정 |
+| setJdbcOperations | JdbcOperations 인스턴스 변경 설정 |
+| setTablePrefix | "BATCH_" prefix 를 변경 |
+
+```java
+public class CustomBatchConfigurer extends DefaultBatchConfigurer {
+
+    @Autowired
+    @Qualifier("repositoryDataSource")
+    private DataSource dataSource;
+
+    @Autowired
+    @Qualifier("batchTransactionManager")
+    private PlatformTransactionManager transactionManager;
+
+    @Override
+    public PlatformTransactionManager getTransactionManager() {
+        return transactionManager;
+    }
+
+    @Override
+    protected JobRepository createJobRepository() throws Exception {
+        JobRepositoryFactoryBean factoryBean = new JobRepositoryFactoryBean();
+        factoryBean.setDatabaseType(DatabaseType.MYSQL.getProductName());
+        factoryBean.setTablePrefix("FOO_");
+        factoryBean.setIsolationLevelForCreate("ISOLATION_REPEATABLE_READ");
+        factoryBean.setDataSource(dataSource);
+        factoryBean.afterPropertiesSet();
+        return factoryBean.getObject();
+    }
+
+    @Override
+    protected JobExplorer createJobExplorer() throws Exception {
+        JobExplorerFactoryBean factoryBean = new JobExplorerFactoryBean();
+        factoryBean.setDataSource(dataSource);
+        factoryBean.setTablePrefix("FOO_");
+        factoryBean.afterPropertiesSet();
+        return factoryBean.getObject();
+    }
+}
+```
+
+### JobLauncher 커스터마이징
+- JobLauncher 는 스프링 배치 잡을 실행하는 엔트리포인트 이다.
+- 스프링부트는 기본적으로 **SimpleJobLauncher** 를 사용하며, 대부분의 경우 JobLauncher 를 커스터마이징 할 필요가 없다.
+- 하지만 Spring MVC 의 일부분으로 존재하고, 잡의 제어를 API 형태로 노출한다면 이를 커스텀 하고 싶을 수 도 있다.
+
+`JobLauncher 커스터마이징`
+
+| 접근자 명 | 설명 |
+| --- | --- |
+| setJobRepository | JobRepository 지정 |
+| setTaskExecutor | JobLauncher 가 사용할 TaskExecutor 지정 / 기본 : SyncTaskExecutor |
+
+
+### 데이터베이스 구성하기
+
+```yaml
+spring:
+  datasource:
+    driver-class-name: com.mysql.cj.jdbc.Driver
+    username: root
+    password: pass
+  batch:
+    jdbc:
+      initialize-schema: always
+```
+- spring.batch.jdbc.initialize-schema 옵션은, 스프링부트가 스프링 배치 스키마 를 자동 생성할지 설정하는 옵션이다.
+  - always: 항상 재실행, drop 문이 존재하지 않고, 오류 발생시 무시된다. (개발환경 권장)
+  - never : 실행하지않음
+  - embedded : 내장 데이텁에ㅣ스 사용시 각 실행시 데이터가 초기화된 데이터베이스 인스턴스를 사용한다는 가정하에 스크립트를 실행한다.
+
+## 잡 메타데이터 사용하기
+- JobExplorer 를 통해 JobRepository 에 존재하는 다양한 메타데이터를 읽기전용으로 쉽게 다룰수 있게 제공한다.
+
+### JobExplorer
+- JobRepository 에 존재하는 메타데이터에 접근하는 시작점
+- 기본적인 목적은 **읽기 전용** 상태로 JobRepository 데이터에 접근하는 기능을 제공하는 것이다.
+
+| 메소드 | 설명 |
+| --- | --- |
+| Set<JobExecution> findRunningJobExecutions(String jobName) | 종료시간이 존재하지 않는 모든 JobExecution 반환 |
+| List<JobInstance> findJobInstanceByName(String, int start, int count) | 전달받은 이름을 가진 JobInstance 목록을 반환한다 (페이징) |
+| JobExecution getJobExecution(Long executionId) | 전달받은 ID 가진 JobExecution 을 반환하며, 존재하지 않을경우 Null 을 반환 |
+| List<JobExecution> getJobExecutions(JobInstance instance) | 전달받은 JobInstance 와 관련된 모든 JobExecution 목록을 반환 |
+| JobInstance getJobInstance(Long instanceId) | 전달받은 ID 가진 JobInstance 를 반환하며, 존재하지 않을 경우 Null 을 반환 |
+| List<JobInstance> getJobInstances(String jobName, int start, int count) | 전달받은 인덱스로 부터 지정한 개수 만큼 범위에 존재하는 JobInstance 를 반환 / count 파라미터는 반환할 최대 JobInstance 개수를 의미 |
+| int getJobInstanceCount(String jobName) | 전달받은 잡 일므으로 생성된 JobInstance 개수를 반환 |
+| List<String> getJobNames() | JobRepository 에 저장되어 있는 고유한 모든 잡 이름을 알파벳 순서대로 반환 |
+| StepExecution getStepExecution(Long jobExecutionId, Long stepExecutionId) | 전달받은 StepExecution ID 와 부모 JobInstance ID 를 가진 StepExecution 을 반환 |
+
+```java
+@EnableBatchProcessing
+@SpringBootApplication
+public class Chapter05Application {
+
+    @Autowired
+    private JobBuilderFactory jobBuilderFactory;
+
+    @Autowired
+    private StepBuilderFactory stepBuilderFactory;
+
+    @Autowired
+    private JobExplorer jobExplorer;
+
+    @Bean
+    public Tasklet explorerTasklet() {
+        return new ExploringTasklet(jobExplorer);
+    }
+
+    @Bean
+    public Step explorerStep() {
+        return this.stepBuilderFactory.get("explorerStep")
+            .tasklet(explorerTasklet())
+            .build();
+    }
+
+    @Bean
+    public Job explorerJob() {
+        return this.jobBuilderFactory.get("explorerJob")
+            .start(explorerStep())
+            .build();
+    }
+
+    public static class ExploringTasklet implements Tasklet {
+
+        private JobExplorer explorer;
+
+        public ExploringTasklet(JobExplorer explorer) {
+            this.explorer = explorer;
+        }
+
+        @Override
+        public RepeatStatus execute(
+            StepContribution contribution,
+            ChunkContext chunkContext
+        ) throws Exception {
+            String jobName = chunkContext.getStepContext().getJobName();
+            List<JobInstance> instances = explorer.getJobInstances(jobName, 0, Integer.MAX_VALUE);
+
+            System.out.println(String.format("There are %d job instances for the job %s", instances.size(), jobName));
+            System.out.println("They have had the following results");
+            System.out.println("****************************************************************");
+
+            for (JobInstance instance : instances) {
+                List<JobExecution> jobExecutions = explorer.getJobExecutions(instance);
+                System.out.println(String.format("Instance %d had %d executions", instance.getInstanceId(), jobExecutions.size()));
+
+                for (JobExecution jobExecution : jobExecutions) {
+                    System.out.println(String.format("\tExecution %d resulted in ExitStatus %s", jobExecution.getId(), jobExecution.getExitStatus()));
+                }
+            }
+
+            return RepeatStatus.FINISHED;
+        }
+    }
+
+    public static void main(String[] args) {
+        SpringApplication.run(Chapter05Application.class, args);
+    }
+}
+```
+
 ## 참고
 - https://kwonnam.pe.kr/wiki/springframework/batch
