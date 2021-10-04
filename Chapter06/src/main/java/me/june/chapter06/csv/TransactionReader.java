@@ -57,7 +57,8 @@ public class TransactionReader implements ItemStreamReader<Transaction> {
          */
 
         if (this.recordCount == 25) {
-            throw new ParseException("This isn't what i hoped to happen");
+//            throw new ParseException("This isn't what i hoped to happen");
+//            throw new IllegalArgumentException();
         }
         return process(fieldSetReader.read());
     }

@@ -174,6 +174,21 @@ public class TransactionProcessingJob {
             .build();
     }
 
+    /**
+        중지 트랜지션 구성
+     @Bean
+     public Job transactionJob() {
+         return this.jobBuilderFactory.get("transactionJob")
+         .preventRestart() // 실패또는 어떤 이유든 중지되었다면 재시작 할 수 없다.
+         .start(importTransactionFileStep())
+         .on("STOPPED").stopAndRestart(importTransactionFileStep())
+         .from(importTransactionFileStep()).on("*").to(applyTransactionStep())
+         .from(applyTransactionStep()).next(generateAccountSummaryStep())
+         .end()
+         .build();
+     }
+     */
+
     @Bean
     public Job transactionJob() {
         return this.jobBuilderFactory.get("transactionJob")
