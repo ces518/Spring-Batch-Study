@@ -1,9 +1,13 @@
 package me.june.chapter07.domain;
 
 import java.util.List;
+import javax.xml.bind.annotation.XmlElement;
+import javax.xml.bind.annotation.XmlElementWrapper;
+import javax.xml.bind.annotation.XmlRootElement;
 import lombok.Data;
 
 @Data
+@XmlRootElement
 public class Customer {
 
     private String middleInitial;
@@ -17,6 +21,12 @@ public class Customer {
     private String zipCode;
 
     private List<Transaction> transactions;
+
+    @XmlElementWrapper(name = "transactions")
+    @XmlElement(name = "transaction")
+    public void setTransactions(List<Transaction> transactions) {
+        this.transactions = transactions;
+    }
 
     @Override
     public String toString() {

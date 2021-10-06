@@ -9,18 +9,27 @@ import org.springframework.batch.item.ItemStreamReader;
 import org.springframework.batch.item.NonTransientResourceException;
 import org.springframework.batch.item.ParseException;
 import org.springframework.batch.item.UnexpectedInputException;
+import org.springframework.batch.item.file.ResourceAwareItemReaderItemStream;
+import org.springframework.core.io.Resource;
 
 /**
  * ItemReader 인터페이스가 아닌 ItemStreamReader 인터페이스를 구현했다.
  * - 이는 ItemReader / ItemStream 를 Combined 한 Convenience Interface
  */
-public class CustomerFileReader implements ItemStreamReader<Customer> {
+//public class CustomerFileReader implements ItemStreamReader<Customer> {
+public class CustomerFileReader implements ResourceAwareItemReaderItemStream<Customer> {
 
     private Object currentItem = null;
 
-    private ItemStreamReader<Object> delegate;
+//    private ItemStreamReader<Object> delegate;
 
-    public CustomerFileReader(ItemStreamReader<Object> delegate) {
+//    public CustomerFileReader(ItemStreamReader<Object> delegate) {
+//        this.delegate = delegate;
+//    }
+
+    private ResourceAwareItemReaderItemStream<Object> delegate;
+
+    public CustomerFileReader(ResourceAwareItemReaderItemStream<Object> delegate) {
         this.delegate = delegate;
     }
 
@@ -72,5 +81,10 @@ public class CustomerFileReader implements ItemStreamReader<Customer> {
             currentItem = delegate.read();
         }
         return currentItem;
+    }
+
+    @Override
+    public void setResource(Resource resource) {
+        this.delegate.setResource(resource);
     }
 }

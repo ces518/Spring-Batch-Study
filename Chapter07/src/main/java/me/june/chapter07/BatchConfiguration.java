@@ -11,7 +11,9 @@ import org.springframework.batch.core.configuration.annotation.StepBuilderFactor
 import org.springframework.batch.core.configuration.annotation.StepScope;
 import org.springframework.batch.item.ItemWriter;
 import org.springframework.batch.item.file.FlatFileItemReader;
+import org.springframework.batch.item.file.MultiResourceItemReader;
 import org.springframework.batch.item.file.builder.FlatFileItemReaderBuilder;
+import org.springframework.batch.item.file.builder.MultiResourceItemReaderBuilder;
 import org.springframework.batch.item.file.mapping.BeanWrapperFieldSetMapper;
 import org.springframework.batch.item.file.mapping.FieldSetMapper;
 import org.springframework.batch.item.file.mapping.PatternMatchingCompositeLineMapper;
@@ -32,6 +34,22 @@ public class BatchConfiguration {
 
     @Autowired
     private StepBuilderFactory stepBuilderFactory;
+
+    /**
+     * 동일한 형식의 파일을 한번에 여러개 읽도록 처리
+     * MultiResourceItemReader 는 다른 ItemReader 를 래핑한다.
+     */
+    @StepScope
+    @Bean
+    public MultiResourceItemReader multiCustomerReader(
+        @Value("#{jobParameters['customerFile']}") Resource[] inputFiles
+    ) {
+        return new MultiResourceItemReaderBuilder<>()
+            .name("multiCustomerReader")
+            .resources(inputFiles)
+            .delegate(customerFileReader())
+            .build();
+    }
 
     /**
      * FlatFileItemReader 는 파일의 레코드를 객체로 변환할 때 LineMapper 를 사용한다.
