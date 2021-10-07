@@ -25,7 +25,7 @@ import org.springframework.context.annotation.Bean;
 @EnableBatchProcessing
 @SpringBootApplication
 @EntityScan(basePackages = "me.june.chapter07.entity")
-public class JpaCursorBatchConfiguration {
+public class JpaPagingBatchConfiguration {
 
     @Autowired
     private JobBuilderFactory jobBuilderFactory;
@@ -72,6 +72,6 @@ public class JpaCursorBatchConfiguration {
     }
 
     public static void main(String[] args) {
-        SpringApplication.run(JpaCursorBatchConfiguration.class, "city=Chicago id=1");
+        SpringApplication.run(JpaPagingBatchConfiguration.class, "city=Chicago id=1");
     }
 }
