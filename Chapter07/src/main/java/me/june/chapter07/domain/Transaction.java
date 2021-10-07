@@ -7,7 +7,7 @@ import javax.xml.bind.annotation.XmlType;
 import lombok.Data;
 
 @Data
-@XmlType(name = "transaction")
+//@XmlType(name = "transaction")
 public class Transaction {
 
     private String accountNumber;

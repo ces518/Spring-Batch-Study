@@ -43,13 +43,13 @@ public class CustomerFileReader implements ResourceAwareItemReaderItemStream<Cus
         currentItem = null;
 
         if (customer != null) {
-            customer.setTransactions(new ArrayList<>());
+//            customer.setTransactions(new ArrayList<>());
 
             // 거래정보 읽기
             // 만약 다음 고객 레코드가 발견되면 현재 고객 레코드가 끝난것으로 간주
             // 이런 로직을 제어 중지 로직 (control break logic) 이라고한다.
             while (peek() instanceof Transaction) {
-                customer.getTransactions().add((Transaction) currentItem);
+//                customer.getTransactions().add((Transaction) currentItem);
                 currentItem = null;
             }
         }
