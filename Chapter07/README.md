@@ -1294,11 +1294,579 @@ public class JsonBatchConfiguration {
 }
 ```
 
+## 데이터베이스 입력
+
+### JDBC
+- 스프링이 제공하는 JdbcTemplate 을 사용하면, 모든 로우를 도메인 객체로 변환해 메모리에 적재한다. (100만건이라면 100만건 모두 메모리에 올라가 OOM 이 발생할 것이다..)
+- 이에 대한 대안으로 스프링 배치는 한번에 처리할 만큼 레코드만 로딩하는 두 가지 기법을 제공한다.
+  1. 커서 Cursor
+  2. 페이징 Paging
+
+`예제 Customer 테이블 데이터베이스 모델`
+
+```sql
+-- auto-generated definition
+create table customer
+(
+    id             int auto_increment
+        primary key,
+    first_name     varchar(45) null,
+    middle_initial varchar(1)  null,
+    address        varchar(45) null,
+    city           varchar(45) null,
+    state          varchar(2)  null,
+    last_name      varchar(45) null,
+    zip_code       varchar(5)  null
+);
+
+```
+
+`Customer 도메인 객체`
+
+```java
+@Data
+public class Customer {
+    
+    private Long id;
+    private String middleInitial;
+    private String firstName;
+    private String lastName;
+    private String address;
+    private String city;
+    private String state;
+    private String zipCode;
+}
+```
+
+`CustomerRowMapper`
+
+```java
+public class CustomerRowMapper implements RowMapper<Customer> {
+
+    @Override
+    public Customer mapRow(ResultSet rs, int rowNum) throws SQLException {
+        Customer customer = new Customer();
+        customer.setId(rs.getLong("id"));
+        customer.setAddress(rs.getString("address"));
+        customer.setCity(rs.getString("city"));
+        customer.setFirstName(rs.getString("first_name"));
+        customer.setLastName(rs.getString("last_name"));
+        customer.setMiddleInitial(rs.getString("middle_initial"));
+        customer.setState(rs.getString("state"));
+        customer.setZipCode(rs.getString("zip_code"));
+        return customer;
+    }
+}
+```
+
+`JDBC 커서`
+- 커서는 표준 java.sql.ResultSet 으로 구현된다.
+- ResultSet 이 open 되면 next() 메소드를 호출할 때마다 데이터베이스에서 배치 레코드를 가져와 반환한다.
+- 데이터베이스에서 레코드를 **스트리밍** 하는 기법
+
+```java
+/**
+ * Cursor 방식은 1건씩 데이터를 **스트리밍** 한다.
+ * 대용량 데이터일 경우 1건씩 처리하기 때문에 매번 데이터를 읽어올 때 마다 네트워크 오버헤드가 발생한다.
+ */
+@EnableBatchProcessing
+@SpringBootApplication
+public class JdbcCursorBatchConfiguration {
+
+    @Autowired
+    private JobBuilderFactory jobBuilderFactory;
+
+    @Autowired
+    private StepBuilderFactory stepBuilderFactory;
+
+    @Bean
+    public JdbcCursorItemReader<Customer> customerItemReader(DataSource dataSource) {
+        return new JdbcCursorItemReaderBuilder<Customer>()
+            .name("customerItemReader")
+            .dataSource(dataSource)
+            .sql("select * from customer where city = ?")
+            .rowMapper(new CustomerRowMapper())
+            .preparedStatementSetter(citySetter(null))
+            .build();
+    }
+
+    /**
+     * ArgumentPreparedStatementSetter 의 인자가 SqlParameterValue 타입일 경우,  값을 설정하는 메타 데이터가 포함되어 있다.
+     * 해당 타입이 아닌경우, 인자로 넘어온 배열의 순서대로 ? 에 바인딩 해준다.
+     *
+     * @see org.springframework.jdbc.core.SqlParameterValue
+     */
+    @StepScope
+    @Bean
+    public ArgumentPreparedStatementSetter citySetter(
+        @Value("#{jobParameters['city']}") String city
+    ) {
+        return new ArgumentPreparedStatementSetter(new Object[]{city});
+    }
+
+    @Bean
+    public Step copyFileStep() {
+        return this.stepBuilderFactory.get("copyFileStep")
+            .<Customer, Customer>chunk(10)
+            .reader(customerItemReader(null)) // CustomItemReader 를 사용
+            .writer(itemWriter())
+            .build();
+    }
+
+    @Bean
+    public ItemWriter itemWriter() {
+        return items -> items.forEach(System.out::println);
+    }
+
+    @Bean
+    public Job job() {
+        return this.jobBuilderFactory.get("jdbcJob")
+            .start(copyFileStep())
+            .build();
+    }
+
+    public static void main(String[] args) {
+        List<String> realArgs = new ArrayList<>(Arrays.asList(args));
+        realArgs.add("id=4");
+        realArgs.add("city=Chicago");
+
+        SpringApplication.run(JdbcCursorBatchConfiguration.class, realArgs.toArray(new String[realArgs.size()]));
+    }
+}
+```
+- 모든 데이터베이스가 ResultSet 으로 데이터를 스트리밍 하는것이 아니므로 주의해야한다.
+  - 일부 데이터베이스는 모든 로우를 한번에 메모리에 올리려고 할 것이다.
+- PreparedStatement 에 SQL 파라미터 바인딩을 하기위해 PreparedStatementSetter 구현체를 사용한다.
+  - ArgumentPreparedStatementSetter
+
+`ArgumentPreparedStatementSetter`
+
+```java
+public class ArgumentPreparedStatementSetter implements PreparedStatementSetter, ParameterDisposer {
+    @Nullable
+    private final Object[] args;
+
+    public ArgumentPreparedStatementSetter(@Nullable Object[] args) {
+        this.args = args;
+    }
+
+    public void setValues(PreparedStatement ps) throws SQLException {
+        if (this.args != null) {
+            for(int i = 0; i < this.args.length; ++i) {
+                Object arg = this.args[i];
+                this.doSetValue(ps, i + 1, arg);
+            }
+        }
+
+    }
+
+    protected void doSetValue(PreparedStatement ps, int parameterPosition, Object argValue) throws SQLException {
+        if (argValue instanceof SqlParameterValue) {
+            SqlParameterValue paramValue = (SqlParameterValue)argValue;
+            StatementCreatorUtils.setParameterValue(ps, parameterPosition, paramValue, paramValue.getValue());
+        } else {
+            StatementCreatorUtils.setParameterValue(ps, parameterPosition, -2147483648, argValue);
+        }
+
+    }
+
+    public void cleanupParameters() {
+        StatementCreatorUtils.cleanupParameters(this.args);
+    }
+}
+```
+- ArgumentPreparedStatementSetter 는 Object 배열을 인자로 받아 생성된다.
+- 배열에 담긴 객체가 **SqlParameterValue** 이라면 해당 파라미터 위치에 바인딩 되며
+- 배열에 담긴 객체가 SqlParameterValue 타입이 아니라면, 배열의 인자 순서대로 ? 의 위치에 바인딩된다.
+
+> SqlParameterValue 타입에는 값을 지정할 인덱스 / 값의 타입 등 메타 데이터가 포함되어 있다.
+
+- Cursor 를 사용한 기법은 장/단점이 존재한다.
+- 만약 백만 단위의 레코드를 처리한다면 매 요청시마다 네트워크 오버헤드가 발생하며, ResultSet 은 Thread-Safe 하지 않기 때문에 멀티 스레드 환경에서는 사용할 수 없다.
+
+`JDBC 페이징`
+- 데이터베이스에서 페이지 라고 부르는 청크 크기만큼 레코드를 가져오는 방식
+- 해당 페이지만큼 레코드를 가져올 수 있는 고유한 SQL 쿼리를 통해 생성된다.
+- **페이징 기법을 사용할때도 잡이 처리할 아이템은 한 건씩 처리된다.**
+- 커서 방식이냐, 페이징 방식이냐의 차이는 **데이터를 어떻게 읽어올 것인가** 에 대한 차이이다.
+
+```java
+/**
+ * Paging 기법과 Cursor 기법의 차이는, 데이터베이스에서 데이터를 조회해오는 방식에서 의 차이이다.
+ * 레코드 처리 자체는 한건 씩 처리된다.
+ *
+ * 페이징 처리는 PagingQueryProvider 구현체를 제공해야 한다.
+ * 각 데이터베이스 마다 구현체를 제공한다.
+ * - 각 구현체를 사용하거나 또는 SqlPagingQueryProviderFactoryBean 을 사용하면 데이터베이스를 감지할 수 있다.
+ */
+@EnableBatchProcessing
+@SpringBootApplication
+public class JdbcPagingBatchConfiguration {
+
+    @Autowired
+    private JobBuilderFactory jobBuilderFactory;
+
+    @Autowired
+    private StepBuilderFactory stepBuilderFactory;
+
+    @StepScope
+    @Bean
+    public JdbcPagingItemReader<Customer> customerItemReader(
+        DataSource dataSource,
+        PagingQueryProvider queryProvider,
+        @Value("#{jobParameters['city']}") String city
+    ) {
+        Map<String, Object> parameterValues = new HashMap<>(1);
+        parameterValues.put("city", city);
+        return new JdbcPagingItemReaderBuilder<Customer>()
+            .name("customerItemReader")
+            .dataSource(dataSource)
+            .queryProvider(queryProvider)
+            .parameterValues(parameterValues)
+            .pageSize(10)
+            .rowMapper(new CustomerRowMapper())
+            .build();
+    }
+
+    @Bean
+    public SqlPagingQueryProviderFactoryBean pagingQueryProvider(DataSource dataSource) {
+        SqlPagingQueryProviderFactoryBean factoryBean = new SqlPagingQueryProviderFactoryBean();
+        factoryBean.setSelectClause("select *");
+        factoryBean.setFromClause("from customer");
+        factoryBean.setWhereClause("where city = :city"); // NamedParameter 방식을 사용해 파라미터를 Map 으로 주입할 수 있다.
+        factoryBean.setSortKey("last_name");
+        factoryBean.setDataSource(dataSource);
+        return factoryBean;
+    }
+
+    @Bean
+    public ItemWriter itemWriter() {
+        return items -> items.forEach(System.out::println);
+    }
+
+    @Bean
+    public Step copyFileStep() {
+        return this.stepBuilderFactory.get("copyFileStep")
+            .<Customer, Customer>chunk(10)
+            .reader(customerItemReader(null, null, null)) // CustomItemReader 를 사용
+            .writer(itemWriter())
+            .build();
+    }
+
+    @Bean
+    public Job job() {
+        return this.jobBuilderFactory.get("jdbcPagingJob")
+            .start(copyFileStep())
+            .build();
+    }
+
+    public static void main(String[] args) {
+        SpringApplication.run(JdbcPagingBatchConfiguration.class, "city=Chicago");
+    }
+}
+```
+- 페이징 기법을 사용한다면 PagingQueryProvider 인터페이스의 구현체를 사용해야 한다.
+  - 이는 각 데이터베이스 마다 개별적인 페이징 구현체를 제공한다.
+- 이를 사용하는 방식은 두 가지이다.
+  1. 사용하려는 데이터베이스 전용 PagingQueryProvider 구현체를 구성한다.
+  2. SqlPagingQueryProviderFactoryBean 을 사용한다.
+- SqlPagingQueryProviderFactoryBean 을 상요하면 사용중인 데이터베이스를 감지하여 적절한 PagingQueryProvider 를 사용한다.
+  - 이 방법이 좀 더 유연하다고 볼 수 있다.
+
+### 하이버네이트
+- 배치 처리에서 하이버네이트를 사용하는 것은 웹 애플리케이션에서 사용하는 것 만큼 직관적이지 않다.
+- 뷰 패턴에서 세션을 사용핳는 것이 일반적인 시나리오이다.
+- 뷰 패턴에서는 요청이 서버에 오면 세션을 열고, 모든 처리를 동일한 세션에서 처리후 뷰를 반환하면 세션을 닫는다.
+- 배치 처리에서 하이버네이트를 그대로 사용하면 **스테이트풀** 세션 구현체를 사용하기 때문에 100만건을 읽고 100만건을 쓴다면 OOM 이 발생한다.
+- JDBC 를 직접 사용할때 보다 더 큰 부하를 유발한다.
+  - 이는 레코드의 개수가 백만건, 천만건 단위로 갈수록 한 건을 처리할 때 밀리세컨드 차이가 큰 차이를 만든다..
+- 스프링 배치가 제공하는 하이버네이트 기반 ItemReader 는 이런 문제들을 해결해준다.
+- 청크단위로 커밋할 때 세션을 플러시 하며, 배치 처리에 관계가 있는 추가 기능을 제공한다.
+
+`의존성 추가`
+
+```xml
+<dependency>
+  <groupId>org.springframework.boot</groupId>
+  <artifactId>spring-boot-starter-data-jpa</artifactId>
+</dependency>
+```
+
+`Customer 엔티티`
+
+```java
+@Entity
+@Table(name = "customer")
+@Getter
+public class Customer implements Serializable {
+
+    @Id @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private Long id;
+
+    private String firstName;
+    private String middleInitial;
+    private String lastName;
+    private String address;
+    private String city;
+    private String state;
+    private String zipCode;
+}
+```
+
+`TransactionManager 커스터마이징`
+- 스프링 배치는 기본적으로 DataSourceTransactionManager 를 사용한다.
+- DataSource 커넥션과 하이버네이트 세션을 아우르는 TransactionManager 가 필요한데, 스프링은 HibernateTransactionManager 를 제공해준다.
+
+```java
+/**
+ * 기본적으로 Web 기반에서 애플리케이션에서 Hibernate 를 사용하는 경우와, 배치애플리케이션에서 사용하는 경우 성격이 좀 다르다. Web 기반의 경우 요청단위로 세션이
+ * 생기고 끊어지지만, 배치애플리케이션의 경우 그렇지 않다. (100만건 처리를 한다면 100만건을 모두 처리할때 까지 세션이 유지되어 OOM 이 날것..) Spring
+ * Batch 는 기본적으로 JdbcTransactionManager 를 사용한다. - DataSource <-> 하이버네이트 세션을 아우르는 TransactionManager
+ * 가 필요 Hibernate 를 사용할경우 스프링이 제공하는 HibernateTransactionManager 를 이용해 이를 해소한다.
+ */
+public class HibernateBatchConfiguration extends DefaultBatchConfigurer {
+
+    private DataSource dataSource;
+    private SessionFactory sessionFactory;
+    private PlatformTransactionManager transactionManager;
+
+    public HibernateBatchConfiguration(DataSource dataSource,
+        EntityManagerFactory entityManagerFactory) {
+        super(dataSource);
+        this.dataSource = dataSource;
+        this.sessionFactory = entityManagerFactory.unwrap(SessionFactory.class);
+        this.transactionManager = new HibernateTransactionManager(this.sessionFactory);
+    }
+
+    @Override
+    public PlatformTransactionManager getTransactionManager() {
+        return this.transactionManager;
+    }
+}
+```
+
+`하이버네이트 커서 처리`
+
+```java
+@EnableBatchProcessing
+@SpringBootApplication
+@EntityScan(basePackages = "me.june.chapter07.entity")
+public class HibernateCursorBatchConfiguration {
+
+    @Autowired
+    private JobBuilderFactory jobBuilderFactory;
+
+    @Autowired
+    private StepBuilderFactory stepBuilderFactory;
+
+    @StepScope
+    @Bean
+    public HibernateCursorItemReader<Customer> customerItemReader(
+        EntityManagerFactory entityManagerFactory,
+        @Value("#{jobParameters['city']}") String city
+    ) {
+        return new HibernateCursorItemReaderBuilder<Customer>()
+            .name("customerItemReader")
+            .sessionFactory(entityManagerFactory.unwrap(SessionFactory.class))
+            .queryString("from Customer where city = :city")
+            .parameterValues(Collections.singletonMap("city", city))
+            .build();
+    }
+
+    @Bean
+    public ItemWriter itemWriter() {
+        return items -> items.forEach(System.out::println);
+    }
+
+    @Bean
+    public Step copyFileStep() {
+        return this.stepBuilderFactory.get("copyFileStep")
+            .<Customer, Customer>chunk(10)
+            .reader(customerItemReader(null, null)) // CustomItemReader 를 사용
+            .writer(itemWriter())
+            .build();
+    }
+
+    @Bean
+    public Job job() {
+        return this.jobBuilderFactory.get("hibernateCursorJob")
+            .start(copyFileStep())
+            .build();
+    }
 
 
+    public static void main(String[] args) {
+        SpringApplication.run(HibernateCursorBatchConfiguration.class, "city=Chicago", "id=2");
+    }
+}
+```
 
+`하이버네이트 페이징 처리`
 
+```java
+@EnableBatchProcessing
+@SpringBootApplication
+@EntityScan(basePackages = "me.june.chapter07.entity")
+public class HibernatePagingBatchConfiguration {
 
+    @Autowired
+    private JobBuilderFactory jobBuilderFactory;
 
+    @Autowired
+    private StepBuilderFactory stepBuilderFactory;
 
+    @StepScope
+    @Bean
+    public HibernatePagingItemReader<Customer> customerItemReader(
+        EntityManagerFactory entityManagerFactory,
+        @Value("#{jobParameters['city']}") String city
+    ) {
+        return new HibernatePagingItemReaderBuilder<Customer>()
+            .name("customerItemReader")
+            .sessionFactory(entityManagerFactory.unwrap(SessionFactory.class))
+            .queryString("from Customer where city = :city")
+            .parameterValues(Collections.singletonMap("city", city))
+            .pageSize(10)
+            .build();
+    }
 
+    @Bean
+    public ItemWriter itemWriter() {
+        return items -> items.forEach(System.out::println);
+    }
+
+    @Bean
+    public Step copyFileStep() {
+        return this.stepBuilderFactory.get("copyFileStep")
+            .<Customer, Customer>chunk(10)
+            .reader(customerItemReader(null, null)) // CustomItemReader 를 사용
+            .writer(itemWriter())
+            .build();
+    }
+
+    @Bean
+    public Job job() {
+        return this.jobBuilderFactory.get("hibernatePagingJob")
+            .start(copyFileStep())
+            .build();
+    }
+
+    public static void main(String[] args) {
+        SpringApplication.run(HibernatePagingBatchConfiguration.class, "city=Chicago");
+    }
+}
+```
+
+### JPA
+- 하이버네이트의 경우 Cursor 방식을 지원하지만 JPA 의 경우 Cursor 방식을 지원하지 않는다.
+- 사실 이전예제에서 선보인 TransactionManager 커스터마이징은 스프링 부트 스타터를 사용한다면 구현할 필요가 없다.
+- 스프링 부트가 하이버네이트 버전과 유사한 JpaTransactionManager 를 자동설정 해주기 때문이다.
+
+`JpaBatchConfigurer`
+
+```java
+public class JpaBatchConfigurer extends BasicBatchConfigurer {
+    private static final Log logger = LogFactory.getLog(JpaBatchConfigurer.class);
+    private final EntityManagerFactory entityManagerFactory;
+
+    protected JpaBatchConfigurer(BatchProperties properties, DataSource dataSource, TransactionManagerCustomizers transactionManagerCustomizers, EntityManagerFactory entityManagerFactory) {
+        super(properties, dataSource, transactionManagerCustomizers);
+        this.entityManagerFactory = entityManagerFactory;
+    }
+
+    protected String determineIsolationLevel() {
+        logger.warn("JPA does not support custom isolation levels, so locks may not be taken when launching Jobs");
+        return "ISOLATION_DEFAULT";
+    }
+
+    protected PlatformTransactionManager createTransactionManager() {
+        return new JpaTransactionManager(this.entityManagerFactory);
+    }
+}
+```
+
+`배치 잡 설정`
+
+```java
+/**
+ * JPA 는 Cursor 기능을 지원하지 않지만 페이징 기능은 지원한다.
+ */
+@EnableBatchProcessing
+@SpringBootApplication
+@EntityScan(basePackages = "me.june.chapter07.entity")
+public class JpaPagingBatchConfiguration {
+
+    @Autowired
+    private JobBuilderFactory jobBuilderFactory;
+
+    @Autowired
+    private StepBuilderFactory stepBuilderFactory;
+
+    @StepScope
+    @Bean
+    public JpaPagingItemReader<Customer> customerItemReader(
+        EntityManagerFactory entityManagerFactory,
+        @Value("#{jobParameters['city']}") String city
+    ) {
+        CustomerByCityQueryProvider customerByCityQueryProvider = new CustomerByCityQueryProvider();
+        customerByCityQueryProvider.setCityName(city);
+        return new JpaPagingItemReaderBuilder<Customer>()
+            .name("customerItemReader")
+            .entityManagerFactory(entityManagerFactory)
+//            .queryString("select c from Customer c where c.city = :city")
+            .queryProvider(customerByCityQueryProvider)
+            .parameterValues(Collections.singletonMap("city", city))
+            .build();
+    }
+
+    @Bean
+    public ItemWriter itemWriter() {
+        return items -> items.forEach(System.out::println);
+    }
+
+    @Bean
+    public Step copyFileStep() {
+        return this.stepBuilderFactory.get("copyFileStep")
+            .<Customer, Customer>chunk(10)
+            .reader(customerItemReader(null, null)) // CustomItemReader 를 사용
+            .writer(itemWriter())
+            .build();
+    }
+
+    @Bean
+    public Job job() {
+        return this.jobBuilderFactory.get("jpaPagingJob")
+            .start(copyFileStep())
+            .build();
+    }
+
+    public static void main(String[] args) {
+        SpringApplication.run(JpaPagingBatchConfiguration.class, "city=Chicago id=1");
+    }
+}
+
+// QueryProvider
+public class CustomerByCityQueryProvider extends AbstractJpaQueryProvider {
+
+  private String cityName;
+
+  @Override
+  public Query createQuery() {
+    EntityManager entityManager = getEntityManager();
+    Query query = entityManager.createQuery("select c from Customer c where c.city = :city");
+    query.setParameter("city", cityName);
+    return query;
+  }
+
+  @Override
+  public void afterPropertiesSet() throws Exception {
+    Assert.notNull(cityName, "City name is required");
+  }
+
+  public void setCityName(String cityName) {
+    this.cityName = cityName;
+  }
+}
+```
+- 이번 예제에는 queryString 방식과 queryProvider 두 가지 방식을 모두 사용했다.
+- 두 방식 모두 동일한 쿼리를 만드는 예제이다.
