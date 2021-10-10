@@ -1870,3 +1870,419 @@ public class CustomerByCityQueryProvider extends AbstractJpaQueryProvider {
 ```
 - 이번 예제에는 queryString 방식과 queryProvider 두 가지 방식을 모두 사용했다.
 - 두 방식 모두 동일한 쿼리를 만드는 예제이다.
+
+### 스토어드 프로시져
+- 기존의 레거시 환경이라면 관계형 데이터베이스에서 지원하는 저장 프로시져가 사용되었을 가능성이 높다.
+- 스프링 배치는 이러한 저장프로시져를 지원하는 **StoreProcedureItemReader** 를 지원한다.
+
+`예제 프로시저`
+
+```sql
+DELIMITER //
+
+CREATE PROCEDURE customer_list(IN cityOption CHAR(16))
+BEGIN
+  SELECT * FROM customer
+  WHERE city = cityOption;
+
+END //
+
+DELIMITER ;
+```
+
+`배치 잡 설정`
+
+```java
+@EnableBatchProcessing
+@SpringBootApplication
+public class ProcedureBatchConfiguration {
+
+    @Autowired
+    private JobBuilderFactory jobBuilderFactory;
+
+    @Autowired
+    private StepBuilderFactory stepBuilderFactory;
+
+    @StepScope
+    @Bean
+    public StoredProcedureItemReader<Customer> customerItemReader(
+        DataSource dataSource,
+        @Value("#{jobParameters['city']}") String city
+    ) {
+        return new StoredProcedureItemReaderBuilder<Customer>()
+            .name("customerItemReader")
+            .dataSource(dataSource)
+            .procedureName("customer_list")
+            .parameters(new SqlParameter[]{
+                new SqlInOutParameter("cityOption", Types.VARCHAR)}
+            )
+            .preparedStatementSetter(new ArgumentPreparedStatementSetter(new Object[]{city}))
+            .rowMapper(new CustomerRowMapper())
+            .build();
+    }
+    @Bean
+    public Step copyFileStep() {
+        return this.stepBuilderFactory.get("copyFileStep")
+            .<Customer, Customer>chunk(10)
+            .reader(customerItemReader(null, null))
+            .writer(itemWriter())
+            .build();
+    }
+
+    @Bean
+    public ItemWriter itemWriter() {
+        return items -> items.forEach(System.out::println);
+    }
+
+    @Bean
+    public Job json() {
+        return this.jobBuilderFactory.get("procedureJob")
+            .start(copyFileStep())
+            .build();
+    }
+
+    public static void main(String[] args) {
+        SpringApplication.run(ProcedureBatchConfiguration.class, "city=Chicago");
+    }
+}
+
+```
+- StoreProcedureItemReader 는 JdbcCursorItemReader 를 기반으로 설계되었다.
+- 때문에 해당 구성코드도 유사한 부분이 많다.
+
+> 스토어드 프로시져를 실행하면 권한이 없어 실행하지 못하는 경우가 있을수 있으므로 확인이 필요하다.
+
+## 스프링 데이터
+- 스프링 데이터의 목적은 **기본적인 데이터 저장소의 특징을 유지하면서도 친숙하고 일관된 스프링 기반의 데이터 접근 프로그래밍 모델을 제공하는 것이다.**
+- NoSQL / SQL 저장소의 고유 기능을 제공하면서도 **일관된 추상화의 집합 (Repository 인터페이스)** 를 제공한다.
+
+### 몽고 DB
+- 스프링 배치는 페이지 기반의 **MongoItemReader** 를 제공한다.
+
+```xml
+<dependency>
+  <groupId>org.springframework.boot</groupId>
+  <artifactId>spring-boot-starter-data-mongodb</artifactId>
+</dependency>
+```
+
+```java
+@EnableBatchProcessing
+@SpringBootApplication
+public class MongoBatchConfiguration {
+
+    @Autowired
+    private JobBuilderFactory jobBuilderFactory;
+
+    @Autowired
+    private StepBuilderFactory stepBuilderFactory;
+
+    /**
+     * name : 잡 재시작이 가능하도록 ExeuctionContext 상태저장시 사용 storeState 가 true 일 경우 필요
+     * targetType : 반환되는 문서를 역직렬화 할 클래스
+     * jsonQuery : 잡 파라미터로 전달된 값과 동일한 해시태그를 모두 찾는 쿼리
+     * collection : 쿼리 대상 컬렉션
+     * parameterValues : 쿼리에 필요한 모든 파라미터 값
+     * sorts : 정렬 기준 필드와 정렬 방법 MongoItemReader 는 페이지 기반이므로 반드시 정렬되어야한다.
+     * template : 쿼리 실행대상 MongoOperations 구현체
+     */
+    @StepScope
+    @Bean
+    public MongoItemReader<Map> tweetsItemReader(
+        MongoOperations mongoTemplate,
+        @Value("#{jobParameters['hashTag']}") String hashTag
+    ) {
+        return new MongoItemReaderBuilder<Map>()
+            .name("tweetsItemReader")
+            .targetType(Map.class)
+            .jsonQuery("{ \"entities.hashtags.text\" : { $eq: ?0 }}")
+            .collection("tweets_collection")
+            .parameterValues(Collections.singletonList(hashTag))
+            .pageSize(10)
+            .sorts(Collections.singletonMap("created_at", Direction.ASC))
+            .template(mongoTemplate)
+            .build();
+    }
+
+    @Bean
+    public Step copyFileStep() {
+        return this.stepBuilderFactory.get("copyFileStep")
+            .<Map, Map>chunk(10)
+            .reader(tweetsItemReader(null, null))
+            .writer(itemWriter())
+            .build();
+    }
+
+    @Bean
+    public ItemWriter itemWriter() {
+        return items -> items.forEach(System.out::println);
+    }
+
+    @Bean
+    public Job job() {
+        return this.jobBuilderFactory.get("mongoJob")
+            .start(copyFileStep())
+            .build();
+    }
+
+    public static void main(String[] args) {
+        SpringApplication.run(MongoBatchConfiguration.class, "hashTag=nodejs");
+    }
+}
+```
+- MongoItemReader 의 구성요소를 보면 다음과 같다.
+- name : 잡 재시작이 가능하도록 ExecutionContext 상태저장시 사용 storeState 가 true 일 경우 필요
+- targetType : 반환되는 문서를 역직렬화 할 클래스
+- jsonQuery : 잡 파라미터로 전달된 값과 동일한 해시태그를 모두 찾는 쿼리
+- collection : 쿼리 대상 컬렉션
+- parameterValues : 쿼리에 필요한 모든 파라미터 값
+- sorts : 정렬 기준 필드와 정렬 방법 MongoItemReader 는 페이지 기반이므로 반드시 정렬되어야한다.
+- template : 쿼리 실행대상 MongoOperations 구현체
+
+### 스프링 데이터 리포지토리
+- 스프링 배치는 스프링 데이터와 호환성이 좋다.
+- 그 이유는 스프링 배치가 스프링 데이터의 **PagingAndSortingRepository** 를 활용하기 때문이다.
+- 이는 표준화된 방법으로 데이터를 페이징하거나 정렬할 수 있는 기능을 제공하는 리포지토리를 정의한다.
+- **RepositoryItemReader** 를 사용하면 스프링 데이터가 리포지터리를 지원하는 어떤 데이터 저장소건 상관없이 해당 데이터 저장소에 질의를 수행할 수 있다.
+
+`CustomerRepository`
+
+```java
+public interface CustomerRepository extends JpaRepository<Customer, Long> {
+    Page<Customer> findByCity(String city, Pageable pageable);
+}
+```
+
+`배치 잡 설정`
+
+```java
+@EnableBatchProcessing
+@SpringBootApplication
+@EntityScan("me.june.chapter07.entity")
+@EnableJpaRepositories(basePackages = "me.june.chapter07.entity")
+public class JpaRepositoryBatchConfiguration {
+
+    @Autowired
+    private JobBuilderFactory jobBuilderFactory;
+
+    @Autowired
+    private StepBuilderFactory stepBuilderFactory;
+
+    @StepScope
+    @Bean
+    public RepositoryItemReader<Customer> customerItemReader(
+        CustomerRepository repository,
+        @Value("#{jobParameters['city']}") String city
+    ) {
+        return new RepositoryItemReaderBuilder<Customer>()
+            .name("customerItemReader")
+            .arguments(Collections.singletonList(city))
+            .methodName("findByCity")
+            .repository(repository)
+            .sorts(Collections.singletonMap("lastName", Direction.ASC))
+            .build();
+    }
+
+    @Bean
+    public ItemWriter itemWriter() {
+        return items -> items.forEach(System.out::println);
+    }
+
+    @Bean
+    public Step copyFileStep() {
+        return this.stepBuilderFactory.get("copyFileStep")
+            .<Customer, Customer>chunk(10)
+            .reader(customerItemReader(null, null)) // CustomItemReader 를 사용
+            .writer(itemWriter())
+            .build();
+    }
+
+    @Bean
+    public Job job() {
+        return this.jobBuilderFactory.get("jpaRepositoryJob")
+            .start(copyFileStep())
+            .build();
+    }
+
+    public static void main(String[] args) {
+        SpringApplication.run(JpaRepositoryBatchConfiguration.class, "city=Chicago");
+    }
+}
+```
+- RepositoryItemReader 의 구성요소를 보면 다음과 같다.
+- Pageable 파라미터를 제외한 메소드에 필요한 파라미터들, 호출할 메소드명, 리포지토리 구현체, 정렬 조건 등을 전달해 사용한다.
+
+### Querydsl 사용하기
+- QuerydslItemReader 를 공식적으로 지원하지 않는다 라는 포스트가 많은데, 개인적인 생각으로는 Querydsl 은 JPA 의 일부라고 생각한다.
+  - JPQL QueryBuilder 그 이상 그이하도 아니다
+- 때문에 Querydsl 을 공식지원하지 않는 것은 이와 같은 이유때문이 아닐까 라고 생각한다.
+
+`Repository 를 사용하는 방식`
+- 이 방법은 RepositoryItemReader 를 사용하는 방법과 동일하다.
+- Custom/Impl 형태로 Querydsl 을 사용해서 제공하는 방식
+
+```java
+public interface CustomerRepository extends JpaRepository<Customer, Long>, CustomerRepositoryCustom {
+    Page<Customer> findByCity(String city, Pageable pageable);
+}
+
+public interface CustomerRepositoryCustom {
+  Page<Customer> findByCityQuerydsl(String city, Pageable pageable);
+}
+
+public class CustomerRepositoryImpl extends QuerydslRepositorySupport implements CustomerRepositoryCustom {
+
+  public CustomerRepositoryImpl() {
+    super(Customer.class);
+  }
+
+  @Override
+  public Page<Customer> findByCityQuerydsl(String city, Pageable pageable) {
+    return applyPagination(pageable, contentQuery -> contentQuery.selectFrom(customer)
+            .where(customer.city.eq(city)));
+  }
+}
+```
+
+```java
+@EnableBatchProcessing
+@SpringBootApplication
+@EntityScan("me.june.chapter07.entity")
+@EnableJpaRepositories(basePackages = "me.june.chapter07.entity")
+public class QuerydslBatchConfiguration {
+
+    @Autowired
+    private JobBuilderFactory jobBuilderFactory;
+
+    @Autowired
+    private StepBuilderFactory stepBuilderFactory;
+
+    @StepScope
+    @Bean
+    public RepositoryItemReader<Customer> customerItemReader(
+        CustomerRepository repository,
+        @Value("#{jobParameters['city']}") String city
+    ) {
+        return new RepositoryItemReaderBuilder<Customer>()
+            .name("customerItemReader")
+            .arguments(Collections.singletonList(city))
+            .methodName("findByCityQuerydsl")
+            .repository(repository)
+            .sorts(Collections.singletonMap("lastName", Direction.ASC))
+            .build();
+    }
+
+    @Bean
+    public ItemWriter itemWriter() {
+        return items -> items.forEach(System.out::println);
+    }
+
+    @Bean
+    public Step copyFileStep() {
+        return this.stepBuilderFactory.get("copyFileStep")
+            .<Customer, Customer>chunk(10)
+            .reader(customerItemReader(null, null)) // CustomItemReader 를 사용
+            .writer(itemWriter())
+            .build();
+    }
+
+    @Bean
+    public Job job() {
+        return this.jobBuilderFactory.get("querydslJob")
+            .start(copyFileStep())
+            .build();
+    }
+
+    public static void main(String[] args) {
+        SpringApplication.run(QuerydslBatchConfiguration.class, "city=Chicago");
+    }
+}
+```
+
+`JpaQueryProvider 를 사용하는 방식`
+- 앞서 살펴본 JpaQueryProvider 의 변형이다. 
+
+```java
+public class QuerydslQueryProvider extends AbstractJpaQueryProvider {
+
+  private JPAQueryFactory queryFactory;
+  private String cityName;
+
+  public QuerydslQueryProvider(EntityManager entityManager) {
+    this.queryFactory = new JPAQueryFactory(entityManager);
+  }
+
+  @Override
+  public Query createQuery() {
+    return queryFactory
+            .select(customer)
+            .from(customer)
+            .where(customer.city.eq(cityName))
+            .createQuery();
+  }
+
+  @Override
+  public void afterPropertiesSet() throws Exception {
+    Assert.notNull(cityName, "City name is required");
+  }
+
+  public void setCityName(String cityName) {
+    this.cityName = cityName;
+  }
+}
+
+@EnableBatchProcessing
+@SpringBootApplication
+@EntityScan(basePackages = "me.june.chapter07.entity")
+public class QuerydslBatchConfiguration {
+
+    @Autowired
+    private JobBuilderFactory jobBuilderFactory;
+
+    @Autowired
+    private StepBuilderFactory stepBuilderFactory;
+
+    @Autowired
+    private EntityManager entityManager;
+
+    @StepScope
+    @Bean
+    public JpaPagingItemReader<Customer> customerItemReader(
+        EntityManagerFactory entityManagerFactory,
+        @Value("#{jobParameters['city']}") String city
+    ) {
+        QuerydslQueryProvider querydslQueryProvider = new QuerydslQueryProvider(entityManager);
+        querydslQueryProvider.setCityName(city);
+        return new JpaPagingItemReaderBuilder<Customer>()
+            .name("customerItemReader")
+            .entityManagerFactory(entityManagerFactory)
+            .queryProvider(querydslQueryProvider)
+            .build();
+    }
+
+    @Bean
+    public ItemWriter itemWriter() {
+        return items -> items.forEach(System.out::println);
+    }
+
+    @Bean
+    public Step copyFileStep() {
+        return this.stepBuilderFactory.get("copyFileStep")
+            .<Customer, Customer>chunk(10)
+            .reader(customerItemReader(null, null)) // CustomItemReader 를 사용
+            .writer(itemWriter())
+            .build();
+    }
+
+    @Bean
+    public Job job() {
+        return this.jobBuilderFactory.get("querydslProviderJob")
+            .start(copyFileStep())
+            .build();
+    }
+
+    public static void main(String[] args) {
+        SpringApplication.run(QuerydslBatchConfiguration.class, "city=Chicago id=1");
+    }
+}
+```
