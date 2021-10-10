@@ -2286,3 +2286,613 @@ public class QuerydslBatchConfiguration {
     }
 }
 ```
+
+## 기존 서비스 활용
+- 대부분의 경우 현재 서비스 중인 애플리케이션이 존재한다.
+- 배치 처리에서 기존 애플리케이션 코드를 재활용할 순 없을까 ?
+- 4장에서 살펴봤듯이 스프링 배치가 테스클릿에서 별도 기능을 사용할 수 있게 Adapter 들을 제공해주었다.
+- 이와 마찬가지로 **ItemReaderAdapter** 를 활용하면 기존서비스를 활용한 ItemReader 사용이 가능해진다.
+
+`CustomerService`
+
+```java
+@Component
+public class CustomerService {
+
+    private List<Customer> customers;
+    private int curIndex;
+
+    private String[] firstNames = {"Michael", "Warren", "Ann", "Terrence",
+        "Erica", "Laura", "Steve", "Larry"};
+    private String middleInitial = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    private String[] lastNames = {"Gates", "Darrow", "Donnelly", "Jobs",
+        "Buffett", "Ellison", "Obama"};
+    private String[] streets = {"4th Street", "Wall Street", "Fifth Avenue",
+        "Mt. Lee Drive", "Jeopardy Lane",
+        "Infinite Loop Drive", "Farnam Street",
+        "Isabella Ave", "S. Greenwood Ave"};
+    private String[] cities = {"Chicago", "New York", "Hollywood", "Aurora",
+        "Omaha", "Atherton"};
+    private String[] states = {"IL", "NY", "CA", "NE"};
+
+    private Random generator = new Random();
+
+    public CustomerService() {
+        curIndex = 0;
+
+        customers = new ArrayList<>();
+
+        for (int i = 0; i < 100; i++) {
+            customers.add(buildCustomer());
+        }
+    }
+
+    private Customer buildCustomer() {
+        Customer customer = new Customer();
+
+        customer.setId((long) generator.nextInt(Integer.MAX_VALUE));
+        customer.setFirstName(
+            firstNames[generator.nextInt(firstNames.length - 1)]);
+        customer.setMiddleInitial(
+            String.valueOf(middleInitial.charAt(
+                generator.nextInt(middleInitial.length() - 1))));
+        customer.setLastName(
+            lastNames[generator.nextInt(lastNames.length - 1)]);
+        customer.setAddress(generator.nextInt(9999) + " " +
+            streets[generator.nextInt(streets.length - 1)]);
+        customer.setCity(cities[generator.nextInt(cities.length - 1)]);
+        customer.setState(states[generator.nextInt(states.length - 1)]);
+        customer.setZipCode(String.valueOf(generator.nextInt(99999)));
+
+        return customer;
+    }
+
+    public Customer getCustomer() {
+        Customer cust = null;
+
+        if (curIndex < customers.size()) {
+            cust = customers.get(curIndex);
+            curIndex++;
+        }
+
+        return cust;
+    }
+}
+```
+
+`배치 잡 설정`
+
+```java
+@EnableBatchProcessing
+@SpringBootApplication
+public class ServiceBatchConfiguration {
+
+    @Autowired
+    private JobBuilderFactory jobBuilderFactory;
+
+    @Autowired
+    private StepBuilderFactory stepBuilderFactory;
+
+    @StepScope
+    @Bean
+    public ItemReaderAdapter<Customer> customerItemReader(CustomerService customerService) {
+        ItemReaderAdapter<Customer> adapter = new ItemReaderAdapter<>();
+        adapter.setTargetObject(customerService);
+        adapter.setTargetMethod("getCustomer");
+        return adapter;
+    }
+
+    @Bean
+    public ItemWriter itemWriter() {
+        return items -> items.forEach(System.out::println);
+    }
+
+    @Bean
+    public Step copyFileStep() {
+        return this.stepBuilderFactory.get("copyFileStep")
+            .<Customer, Customer>chunk(10)
+            .reader(customerItemReader(null)) // CustomItemReader 를 사용
+            .writer(itemWriter())
+            .build();
+    }
+
+    @Bean
+    public Job job() {
+        return this.jobBuilderFactory.get("serviceJob")
+            .start(copyFileStep())
+            .build();
+    }
+
+    public static void main(String[] args) {
+        SpringApplication.run(ServiceBatchConfiguration.class, args);
+    }
+}
+```
+- ItemReaderAdapter 를 사용해 대상 Object 와 호출할 Method 를 지정해 구성하면 된다.
+
+## 커스텀 입력
+- 스프링 배치가 제공하는 ItemReader 외에 처리가 가능한 입력 형식을 지원해야 할 경우가 있다.
+- 앞에서 살펴보면 CustomerService 를 ItemReader 로 변환해보자.
+
+`CustomerItemReader`
+
+```java
+/**
+ * CustomerService 를 ItemReader 로 변경
+ * getCustomer() 를 ItemReader 인터페이스의 read() 메소드로 변경하기만 하면 된다..
+ *
+ * ItemReader 인터페이스는, **잡을 재실행 할때마다 모든 레코드를 다시 실행** 한다.
+ * 만약 특정한 에러로 인해 잡이 중지되었다 재시작 되었을때, 에러가 발생했던 부분부터 다시 시작하려면, **잡의 상태** 를 기억해야 한다.
+ * 이는 ItemStream 인터페이스를 구현해야 함을 의미한다.
+ *
+ * ItemStreamSupport 클래스를 상속..
+ * 이는 getExecutionContextKey 라는 유틸리티 메소드를 제공 (컴포넌트 명으로 유일한 키를 생성한다.)
+ */
+public class CustomerItemReader extends ItemStreamSupport implements ItemReader<Customer> {
+    private String INDEX_KEY = "current.index.customers";
+
+    private List<Customer> customers;
+    private int curIndex;
+
+    private String[] firstNames = {"Michael", "Warren", "Ann", "Terrence",
+        "Erica", "Laura", "Steve", "Larry"};
+    private String middleInitial = "ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    private String[] lastNames = {"Gates", "Darrow", "Donnelly", "Jobs",
+        "Buffett", "Ellison", "Obama"};
+    private String[] streets = {"4th Street", "Wall Street", "Fifth Avenue",
+        "Mt. Lee Drive", "Jeopardy Lane",
+        "Infinite Loop Drive", "Farnam Street",
+        "Isabella Ave", "S. Greenwood Ave"};
+    private String[] cities = {"Chicago", "New York", "Hollywood", "Aurora",
+        "Omaha", "Atherton"};
+    private String[] states = {"IL", "NY", "CA", "NE"};
+
+    private Random generator = new Random();
+
+    public CustomerItemReader() {
+        curIndex = 0;
+
+        customers = new ArrayList<>();
+
+        for (int i = 0; i < 100; i++) {
+            customers.add(buildCustomer());
+        }
+    }
+
+    private Customer buildCustomer() {
+        Customer customer = new Customer();
+
+        customer.setId((long) generator.nextInt(Integer.MAX_VALUE));
+        customer.setFirstName(
+            firstNames[generator.nextInt(firstNames.length - 1)]);
+        customer.setMiddleInitial(
+            String.valueOf(middleInitial.charAt(
+                generator.nextInt(middleInitial.length() - 1))));
+        customer.setLastName(
+            lastNames[generator.nextInt(lastNames.length - 1)]);
+        customer.setAddress(generator.nextInt(9999) + " " +
+            streets[generator.nextInt(streets.length - 1)]);
+        customer.setCity(cities[generator.nextInt(cities.length - 1)]);
+        customer.setState(states[generator.nextInt(states.length - 1)]);
+        customer.setZipCode(String.valueOf(generator.nextInt(99999)));
+
+        return customer;
+    }
+
+    @Override
+    public Customer read() {
+        Customer cust = null;
+
+        if (curIndex < customers.size()) {
+            cust = customers.get(curIndex);
+            curIndex++;
+        }
+
+        return cust;
+    }
+
+    /**
+     * 스프링 배치가 ItemReader 에서 필요한 상태 초기화시 호출한다.
+     * 이전 상태를 복원 / 특정 파일을 열거나 특정 데이터베이스 연결 하는 등...
+     */
+    @Override
+    public void open(ExecutionContext executionContext) {
+        if (executionContext.containsKey(getExecutionContextKey(INDEX_KEY))) {
+            int index = executionContext.getInt(getExecutionContextKey(INDEX_KEY));
+
+            if (index == 50) {
+                curIndex = 51;
+            } else {
+                curIndex = index;
+            }
+        } else {
+            curIndex = 0;
+        }
+    }
+
+    /**
+     * 스프링 배치가 잡의 상태를 갱신할때 사용한다.
+     */
+    @Override
+    public void update(ExecutionContext executionContext) {
+        executionContext.putInt(getExecutionContextKey(INDEX_KEY), curIndex);
+    }
+}
+```
+- ItemReader 인터페이스는 **잡을 재실행 할때마다 모든 레코드를 다시 실행** 한다.
+- 만약 어떤 사유로 인해 잡이 실패했다가 재실행했을때 실패했던 지점부터 다시 실행하고 싶다면, ItemStream 인터페이스를 구현해야한다.
+- 스프링 배치가 제공하는 **ItemStreamSupport** 를 사용하면 ItemStream 인터페이스를 구현하는 것 뿐 아니라 해당 컴포넌트의 이름으로 고유키를 생성하는 **getExecutionContextKey()** 메소드를 제공한다.
+- 이를 이용해 ExecutionContext 에 현재 잡의 상태를 저장 할 수 있다.
+
+## 에러 처리
+
+### 레코드 건너뛰기
+- 스프링 배치는 특정 예외가 발생 했을 때 레코드를 건너뛰는 기능 (skip) 을 제공한다.
+- 레코드를 건너 뛸 때 고려해야하는 부분은 **어떤 예외를 무시할 것인가** 그리고 **얼마나 많은 레코드를 건너뛸 수 있게 할 것인가** 이다.
+
+`ParseExecption 예외 발생시 10개 까지만 스킵하도록 구성`
+
+```java
+@EnableBatchProcessing
+@SpringBootApplication
+public class SkipBatchConfiguration {
+
+    @Autowired
+    private JobBuilderFactory jobBuilderFactory;
+
+    @Autowired
+    private StepBuilderFactory stepBuilderFactory;
+
+    @Bean
+    public CustomerItemReader customerItemReader() {
+        CustomerItemReader customerItemReader = new CustomerItemReader();
+        customerItemReader.setName("customerItemReader");
+        return customerItemReader;
+    }
+
+    @Bean
+    public ItemWriter itemWriter() {
+        return items -> items.forEach(System.out::println);
+    }
+
+    @Bean
+    public Step copyFileStep() {
+        return this.stepBuilderFactory.get("copyFileStep")
+            .<Customer, Customer>chunk(10)
+            .reader(customerItemReader()) // CustomItemReader 를 사용
+            .writer(itemWriter())
+            .faultTolerant()
+            .skip(ParseException.class) // ParseException 발생시 건너뜀
+            .skipLimit(10) // 10번까지 건너뜀
+            .build();
+    }
+
+    @Bean
+    public Job job() {
+        return this.jobBuilderFactory.get("itemReaderJob")
+            .start(copyFileStep())
+            .build();
+    }
+
+    public static void main(String[] args) {
+        SpringApplication.run(SkipBatchConfiguration.class, args);
+    }
+}
+```
+
+`ParseException 제외한 모든 예외를 스킵하도록 구성`
+
+```java
+@EnableBatchProcessing
+@SpringBootApplication
+public class SkipBatchConfiguration {
+
+    @Autowired
+    private JobBuilderFactory jobBuilderFactory;
+
+    @Autowired
+    private StepBuilderFactory stepBuilderFactory;
+
+    @Bean
+    public CustomerItemReader customerItemReader() {
+        CustomerItemReader customerItemReader = new CustomerItemReader();
+        customerItemReader.setName("customerItemReader");
+        return customerItemReader;
+    }
+
+    @Bean
+    public ItemWriter itemWriter() {
+        return items -> items.forEach(System.out::println);
+    }
+
+    @Bean
+    public Step copyFileStep() {
+        return this.stepBuilderFactory.get("copyFileStep")
+            .<Customer, Customer>chunk(10)
+            .reader(customerItemReader()) // CustomItemReader 를 사용
+            .writer(itemWriter())
+            .faultTolerant()
+            .skip(Exception.class).noSkip(ParseException.class) // ParseException 을 제외한 모든 예외는 건너뜀
+            .skipLimit(10) // 10번까지 건너뜀
+            .build();
+    }
+
+    @Bean
+    public Job job() {
+        return this.jobBuilderFactory.get("itemReaderJob")
+            .start(copyFileStep())
+            .build();
+    }
+
+    public static void main(String[] args) {
+        SpringApplication.run(SkipBatchConfiguration.class, args);
+    }
+}
+```
+
+`SkipPolicy`
+- 스프링 배치는 위 방법 외에도 예외 발생시 스킵 처리를 위한 인터페이스인 **SkipPolicy** 라는 인터페이스를 제공한다.
+- 이 인터페이스는 대상 예외와 건너 뛸 수 있는 횟수를 전달받아 이를 판별할 수 있다.
+
+```java
+/**
+ * 스프링 배치는, 예외가 발생했을때, 스킵 처리를 위한 인터페이스인 SkipPolicy 를 제공한다.
+ * 이는 대상 예외와 건너뛸 수 있는 횟수를 전달받는다.
+ */
+public class FileVerificationSkipper implements SkipPolicy {
+
+    @Override
+    public boolean shouldSkip(Throwable t, int skipCount) throws SkipLimitExceededException {
+        if (t instanceof FileNotFoundException) {
+            return false;
+        } else if (t instanceof ParseException && skipCount <= 10) {
+            return true;
+        } else {
+            return false;
+        }
+    }
+}
+```
+
+### 잘못된 레코드 로깅하기
+- 스프링 배치는 **ItemListener** 를 통해 에러를 일으킨 레코드에 대한 로깅 과 같은 처리를 할수 있게 지원한다.
+- ItemListener 를 구현 하는 방법은 크게 3가지이다.
+  1. ItemReadListener 인터페이스 구현
+  2. ItemListenerSupport 클래스 구현
+  3. @OnReadError 와 같은 애너테이션을 추가한 POJO 구현
+
+`ItemReadListener`
+- ItemReadListener 는 StepListener 인터페이스를 상속받고 있지만, 이는 리스너들이 상속받는 마커인터페이스 이다.
+- ItemReadListener 는 beforeRead(), afterRead(), onReadError() 세 가지 메소드를 제공하고, 이름에서 알 수 있듯이 해당 시점을 기준으로 콜백된다.
+- 에러 발생시 로깅처리를 하기 위해서는 onReadError() 메소드를 구현하면 된다.
+
+```java
+public interface ItemReadListener<T> extends StepListener {
+
+	/**
+	 * Called before {@link ItemReader#read()}
+	 */
+	void beforeRead();
+	
+	/**
+	 * Called after {@link ItemReader#read()}.
+	 * This method is called only for actual items (ie it is not called when the
+	 * reader returns null).
+	 * 
+	 * @param item returned from read()
+	 */
+	void afterRead(T item);
+	
+	/**
+	 * Called if an error occurs while trying to read.
+	 * 
+	 * @param ex thrown from {@link ItemReader}
+	 */
+	void onReadError(Exception ex);
+}
+```
+
+`ItemListenerSupport`
+- ItemListenerSupport 클래스는 ItemReadListener 인터페이스 외에도, ItemProcessListener, ItemWriteListener 인터페이스를 구현하고 있다.
+- 각 인터페이스들은 특정 시점의 전후 처리를 위한 콜백 메소드를 제공하며, ItemListenerSupport 클래스는 이들을 구현하기 위한 Convenient 클래스이다.
+
+```java
+public class ItemListenerSupport<I, O> implements ItemReadListener<I>, ItemProcessListener<I, O>, ItemWriteListener<O> {
+
+	/*
+	 * (non-Javadoc)
+	 *
+	 * @see org.springframework.batch.core.domain.ItemReadListener#afterRead(java.lang.Object)
+	 */
+	@Override
+	public void afterRead(I item) {
+	}
+
+	/*
+	 * (non-Javadoc)
+	 *
+	 * @see org.springframework.batch.core.domain.ItemReadListener#beforeRead()
+	 */
+	@Override
+	public void beforeRead() {
+	}
+
+	/*
+	 * (non-Javadoc)
+	 *
+	 * @see org.springframework.batch.core.domain.ItemReadListener#onReadError(java.lang.Exception)
+	 */
+	@Override
+	public void onReadError(Exception ex) {
+	}
+
+	/*
+	 * (non-Javadoc)
+	 *
+	 * @see org.springframework.batch.core.ItemProcessListener#afterProcess(java.lang.Object,
+	 *      java.lang.Object)
+	 */
+	@Override
+	public void afterProcess(I item, @Nullable O result) {
+	}
+
+	/*
+	 * (non-Javadoc)
+	 *
+	 * @see org.springframework.batch.core.ItemProcessListener#beforeProcess(java.lang.Object)
+	 */
+	@Override
+	public void beforeProcess(I item) {
+	}
+
+	/*
+	 * (non-Javadoc)
+	 *
+	 * @see org.springframework.batch.core.ItemProcessListener#onProcessError(java.lang.Object,
+	 *      java.lang.Exception)
+	 */
+	@Override
+	public void onProcessError(I item, Exception e) {
+	}
+
+	/*
+	 * (non-Javadoc)
+	 *
+	 * @see org.springframework.batch.core.domain.ItemWriteListener#afterWrite()
+	 */
+	@Override
+	public void afterWrite(List<? extends O> item) {
+	}
+
+	/*
+	 * (non-Javadoc)
+	 *
+	 * @see org.springframework.batch.core.domain.ItemWriteListener#beforeWrite(java.lang.Object)
+	 */
+	@Override
+	public void beforeWrite(List<? extends O> item) {
+	}
+
+	/*
+	 * (non-Javadoc)
+	 *
+	 * @see org.springframework.batch.core.domain.ItemWriteListener#onWriteError(java.lang.Exception,
+	 *      java.lang.Object)
+	 */
+	@Override
+	public void onWriteError(Exception ex, List<? extends O> item) {
+	}
+}
+```
+
+`@OnReadError 애노테이션`
+- 마지막으로 @OnReadError 애노테이션을 사용한 POJO 구현이다.
+- 이 애노테이션 외에도 @OnWriterError 와 같은 여러 애노테이션들을 제공한다.
+- 다음은 이를 활용한 에러 로깅에 대한 구현이다.
+
+```java
+/**
+ * 로그를 남기게끔 리스너를 사용하는 방법은 3가지
+ * 1. ItemReadListener 인터페이스 구현
+ * 2. ItemListenerSupport 클래스 상속 후 onReadError 메소드 구현
+ * 3. @OnReadError 애노테이션을 사용한 POJO 사용
+ *
+ * @see org.springframework.batch.core.ItemReadListener
+ * @see org.springframework.batch.core.listener.ItemListenerSupport
+ */
+@Slf4j
+public class CustomerItemListener {
+
+    @OnReadError
+    public void onReadError(Exception e) {
+        if (e instanceof FlatFileParseException) {
+            FlatFileParseException ffpe = (FlatFileParseException) e;
+
+            StringBuilder errorsMessage = new StringBuilder();
+            errorsMessage.append("An error occured while processing the " + ffpe.getLineNumber() + " line of the file. Below was the faulty input.\n");
+            errorsMessage.append(ffpe.getInput() +"\n");
+            log.error(errorsMessage.toString(), ffpe);
+        } else {
+            log.error("An errors has occured", e);
+        }
+
+    }
+}
+```
+
+`배치 잡 설정`
+
+```java
+@EnableBatchProcessing
+@SpringBootApplication
+public class SkipBatchConfiguration {
+
+  @Autowired
+  private JobBuilderFactory jobBuilderFactory;
+
+  @Autowired
+  private StepBuilderFactory stepBuilderFactory;
+
+  @Bean
+  public CustomerItemReader customerItemReader() {
+    CustomerItemReader customerItemReader = new CustomerItemReader();
+    customerItemReader.setName("customerItemReader");
+    return customerItemReader;
+  }
+
+  @Bean
+  public ItemWriter itemWriter() {
+    return items -> items.forEach(System.out::println);
+  }
+
+  @Bean
+  public Step copyFileStep() {
+    return this.stepBuilderFactory.get("copyFileStep")
+            .<Customer, Customer>chunk(10)
+            .reader(customerItemReader()) // CustomItemReader 를 사용
+            .writer(itemWriter())
+            .faultTolerant()
+            .skip(Exception.class).noSkip(ParseException.class) // ParseException 을 제외한 모든 예외는 건너뜀
+            .skipLimit(10) // 10번까지 건너뜀
+            .listener(customerListener())
+            .build();
+  }
+
+  @Bean
+  public CustomerItemListener customerListener() {
+    return new CustomerItemListener();
+  }
+
+  @Bean
+  public Job job() {
+    return this.jobBuilderFactory.get("itemReaderJob")
+            .start(copyFileStep())
+            .build();
+  }
+
+  public static void main(String[] args) {
+    SpringApplication.run(SkipBatchConfiguration.class, args);
+  }
+}
+```
+
+### 입력이 없을때 처리
+- SQL 쿼리 결과가 빈 결과이거나 빈 파일이 존재할 수도 있다.
+- ItemReader 가 입력소스에서 null 을 읽더라도 스프링 배치는 이를 기본으로 평상시 null 을 읽었을 때와 동일하게 처리한다.
+  - 즉 해당 스탭이 완료된 것응로 간주한다.
+- 해당 쿼리가 빈 결과이거나 파일이 비어있을경우 이를 알아야 하는 경우가 존재할 수도 있다.
+- StepListener 의 @AfterStep 을 이용해 해당 기록을 남기는 예제이다.
+
+```java
+public class EmptyInputStepFailure {
+
+    @AfterStep
+    public ExitStatus afterStep(StepExecution execution) {
+        if (execution.getReadCount() > 0) {
+            return execution.getExitStatus();
+        } else {
+            return ExitStatus.FAILED;
+        }
+    }
+}
+```
