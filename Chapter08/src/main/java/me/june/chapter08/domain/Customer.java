@@ -4,8 +4,10 @@ import javax.validation.constraints.NotNull;
 import javax.validation.constraints.Pattern;
 import javax.validation.constraints.Size;
 import lombok.Data;
+import lombok.NoArgsConstructor;
 
 @Data
+@NoArgsConstructor
 public class Customer {
 
     @NotNull(message = "First name is required")
@@ -34,11 +36,21 @@ public class Customer {
     private String state;
 
     /**
-     * Size 와 Pattern 모두 적용한 이유 ? -> Pattern 만적용해도 요구사항은 만족할테지만, 각 애너테이션을 통해 고유 메세지 지정이 가능하다.
-     * -> 또한 필드 값의 길이가 잘못되었는지, 형식이 잘못되었는지 식별이 가능하다는 장점이 있다.
+     * Size 와 Pattern 모두 적용한 이유 ? -> Pattern 만적용해도 요구사항은 만족할테지만, 각 애너테이션을 통해 고유 메세지 지정이 가능하다. -> 또한
+     * 필드 값의 길이가 잘못되었는지, 형식이 잘못되었는지 식별이 가능하다는 장점이 있다.
      */
     @NotNull(message = "Zip is required")
     @Size(min = 5, max = 5)
     @Pattern(regexp = "\\d{5}")
     private String zip;
+
+    public Customer(Customer customer) {
+        this.firstName = customer.getFirstName();
+        this.middleInitial = customer.getMiddleInitial();
+        this.lastName = customer.getLastName();
+        this.address = customer.getAddress();
+        this.city = customer.getCity();
+        this.state = customer.getState();
+        this.zip = customer.getZip();
+    }
 }

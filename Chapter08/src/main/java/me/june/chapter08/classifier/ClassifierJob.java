@@ -1,6 +1,8 @@
-package me.june.chapter08.validation;
+package me.june.chapter08.classifier;
 
 import me.june.chapter08.domain.Customer;
+import me.june.chapter08.itemprocessor.UpperCaseNameService;
+import me.june.chapter08.validation.UniqueLastNameValidator;
 import org.springframework.batch.core.Job;
 import org.springframework.batch.core.Step;
 import org.springframework.batch.core.configuration.annotation.EnableBatchProcessing;
@@ -8,20 +10,23 @@ import org.springframework.batch.core.configuration.annotation.JobBuilderFactory
 import org.springframework.batch.core.configuration.annotation.StepBuilderFactory;
 import org.springframework.batch.core.configuration.annotation.StepScope;
 import org.springframework.batch.item.ItemWriter;
+import org.springframework.batch.item.adapter.ItemProcessorAdapter;
 import org.springframework.batch.item.file.FlatFileItemReader;
 import org.springframework.batch.item.file.builder.FlatFileItemReaderBuilder;
-import org.springframework.batch.item.validator.BeanValidatingItemProcessor;
+import org.springframework.batch.item.support.ClassifierCompositeItemProcessor;
+import org.springframework.batch.item.support.ScriptItemProcessor;
 import org.springframework.batch.item.validator.ValidatingItemProcessor;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.SpringApplication;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
+import org.springframework.classify.Classifier;
 import org.springframework.context.annotation.Bean;
 import org.springframework.core.io.Resource;
 
 @EnableBatchProcessing
 @SpringBootApplication
-public class ValidationJob {
+public class ClassifierJob {
 
     @Autowired
     private JobBuilderFactory jobBuilderFactory;
@@ -52,23 +57,37 @@ public class ValidationJob {
     }
 
     @Bean
-    public BeanValidatingItemProcessor<Customer> customerValidatingItemProcessor() {
-        return new BeanValidatingItemProcessor<>();
-    }
-
-    @Bean
     public UniqueLastNameValidator validator() {
         UniqueLastNameValidator validator = new UniqueLastNameValidator();
         validator.setName("validator");
         return validator;
     }
 
-    /**
-     * 커스텀 벨리데이터를 사용하는 아이템 프로세서
-     */
     @Bean
-    public ValidatingItemProcessor<Customer> customValidatingItemProcessor() {
-        return new ValidatingItemProcessor<>(validator());
+    public ValidatingItemProcessor<Customer> customerValidatingItemProcessor() {
+        ValidatingItemProcessor<Customer> itemProcessor = new ValidatingItemProcessor<>(
+            validator());
+        itemProcessor.setFilter(true);
+        return itemProcessor;
+    }
+
+    @Bean
+    public ItemProcessorAdapter<Customer, Customer> upperCaseItemProcessor(
+        UpperCaseNameService service) {
+        ItemProcessorAdapter<Customer, Customer> adapter = new ItemProcessorAdapter<>();
+        adapter.setTargetObject(service);
+        adapter.setTargetMethod("upperCase");
+        return adapter;
+    }
+
+    @StepScope
+    @Bean
+    public ScriptItemProcessor<Customer, Customer> scriptItemProcessor(
+        @Value("#{jobParameters['script']}") Resource script
+    ) {
+        ScriptItemProcessor<Customer, Customer> processor = new ScriptItemProcessor<>();
+        processor.setScript(script);
+        return processor;
     }
 
     @Bean
@@ -76,20 +95,40 @@ public class ValidationJob {
         return this.stepBuilderFactory.get("copyFileStep")
             .<Customer, Customer>chunk(5)
             .reader(customerItemReader(null))
-            .processor(customValidatingItemProcessor())
+            .processor(itemProcessor())
             .writer(itemWriter())
             .build();
     }
 
+    /**
+     * ZipCode 가 홀수면 UpperCase / 짝수면 lowerCase 를 적용한다.
+     */
+    @Bean
+    public Classifier classifier() {
+        return new ZipCodeClassifier(upperCaseItemProcessor(null), scriptItemProcessor(null));
+    }
+
+    @Bean
+    public ClassifierCompositeItemProcessor<Customer, Customer> itemProcessor() {
+        ClassifierCompositeItemProcessor<Customer, Customer> itemProcessor = new ClassifierCompositeItemProcessor<>();
+        itemProcessor.setClassifier(classifier());
+        return itemProcessor;
+    }
+
     @Bean
     public Job job() {
-        return this.jobBuilderFactory.get("customerValidationJob")
+        return this.jobBuilderFactory.get("classifierJob")
             .start(copyFileStep())
             .build();
     }
 
+    @Bean
+    public UpperCaseNameService upperCaseNameService() {
+        return new UpperCaseNameService();
+    }
+
     public static void main(String[] args) {
-        SpringApplication.run(ValidationJob.class, "customerFile=classpath:input/customer.csv",
-            "id=2");
+        SpringApplication.run(ClassifierJob.class, "customerFile=classpath:input/customer.csv",
+            "script=classpath:input/lowerCase.js", "id=1");
     }
 }

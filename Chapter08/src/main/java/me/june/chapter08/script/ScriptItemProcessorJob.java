@@ -1,4 +1,4 @@
-package me.june.chapter08.validation;
+package me.june.chapter08.script;
 
 import me.june.chapter08.domain.Customer;
 import org.springframework.batch.core.Job;
@@ -10,8 +10,7 @@ import org.springframework.batch.core.configuration.annotation.StepScope;
 import org.springframework.batch.item.ItemWriter;
 import org.springframework.batch.item.file.FlatFileItemReader;
 import org.springframework.batch.item.file.builder.FlatFileItemReaderBuilder;
-import org.springframework.batch.item.validator.BeanValidatingItemProcessor;
-import org.springframework.batch.item.validator.ValidatingItemProcessor;
+import org.springframework.batch.item.support.ScriptItemProcessor;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.SpringApplication;
@@ -21,7 +20,7 @@ import org.springframework.core.io.Resource;
 
 @EnableBatchProcessing
 @SpringBootApplication
-public class ValidationJob {
+public class ScriptItemProcessorJob {
 
     @Autowired
     private JobBuilderFactory jobBuilderFactory;
@@ -51,24 +50,14 @@ public class ValidationJob {
         return (items) -> items.forEach(System.out::println);
     }
 
+    @StepScope
     @Bean
-    public BeanValidatingItemProcessor<Customer> customerValidatingItemProcessor() {
-        return new BeanValidatingItemProcessor<>();
-    }
-
-    @Bean
-    public UniqueLastNameValidator validator() {
-        UniqueLastNameValidator validator = new UniqueLastNameValidator();
-        validator.setName("validator");
-        return validator;
-    }
-
-    /**
-     * 커스텀 벨리데이터를 사용하는 아이템 프로세서
-     */
-    @Bean
-    public ValidatingItemProcessor<Customer> customValidatingItemProcessor() {
-        return new ValidatingItemProcessor<>(validator());
+    public ScriptItemProcessor<Customer, Customer> itemProcessor(
+        @Value("#{jobParameters['script']}") Resource script
+    ) {
+        ScriptItemProcessor<Customer, Customer> processor = new ScriptItemProcessor<>();
+        processor.setScript(script);
+        return processor;
     }
 
     @Bean
@@ -76,20 +65,20 @@ public class ValidationJob {
         return this.stepBuilderFactory.get("copyFileStep")
             .<Customer, Customer>chunk(5)
             .reader(customerItemReader(null))
-            .processor(customValidatingItemProcessor())
+            .processor(itemProcessor(null))
             .writer(itemWriter())
             .build();
     }
 
     @Bean
     public Job job() {
-        return this.jobBuilderFactory.get("customerValidationJob")
+        return this.jobBuilderFactory.get("scriptJob")
             .start(copyFileStep())
             .build();
     }
 
     public static void main(String[] args) {
-        SpringApplication.run(ValidationJob.class, "customerFile=classpath:input/customer.csv",
-            "id=2");
+        SpringApplication.run(ScriptItemProcessorJob.class,
+            "customerFile=classpath:input/customer.csv", "script=classpath:input/upperCase.js");
     }
 }

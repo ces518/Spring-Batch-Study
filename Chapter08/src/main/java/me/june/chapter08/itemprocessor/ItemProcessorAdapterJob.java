@@ -1,4 +1,4 @@
-package me.june.chapter08.validation;
+package me.june.chapter08.itemprocessor;
 
 import me.june.chapter08.domain.Customer;
 import org.springframework.batch.core.Job;
@@ -8,10 +8,9 @@ import org.springframework.batch.core.configuration.annotation.JobBuilderFactory
 import org.springframework.batch.core.configuration.annotation.StepBuilderFactory;
 import org.springframework.batch.core.configuration.annotation.StepScope;
 import org.springframework.batch.item.ItemWriter;
+import org.springframework.batch.item.adapter.ItemProcessorAdapter;
 import org.springframework.batch.item.file.FlatFileItemReader;
 import org.springframework.batch.item.file.builder.FlatFileItemReaderBuilder;
-import org.springframework.batch.item.validator.BeanValidatingItemProcessor;
-import org.springframework.batch.item.validator.ValidatingItemProcessor;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.SpringApplication;
@@ -21,7 +20,7 @@ import org.springframework.core.io.Resource;
 
 @EnableBatchProcessing
 @SpringBootApplication
-public class ValidationJob {
+public class ItemProcessorAdapterJob {
 
     @Autowired
     private JobBuilderFactory jobBuilderFactory;
@@ -52,23 +51,11 @@ public class ValidationJob {
     }
 
     @Bean
-    public BeanValidatingItemProcessor<Customer> customerValidatingItemProcessor() {
-        return new BeanValidatingItemProcessor<>();
-    }
-
-    @Bean
-    public UniqueLastNameValidator validator() {
-        UniqueLastNameValidator validator = new UniqueLastNameValidator();
-        validator.setName("validator");
-        return validator;
-    }
-
-    /**
-     * 커스텀 벨리데이터를 사용하는 아이템 프로세서
-     */
-    @Bean
-    public ValidatingItemProcessor<Customer> customValidatingItemProcessor() {
-        return new ValidatingItemProcessor<>(validator());
+    public ItemProcessorAdapter<Customer, Customer> itemProcessor(UpperCaseNameService service) {
+        ItemProcessorAdapter<Customer, Customer> adapter = new ItemProcessorAdapter<>();
+        adapter.setTargetObject(service);
+        adapter.setTargetMethod("upperCase");
+        return adapter;
     }
 
     @Bean
@@ -76,20 +63,25 @@ public class ValidationJob {
         return this.stepBuilderFactory.get("copyFileStep")
             .<Customer, Customer>chunk(5)
             .reader(customerItemReader(null))
-            .processor(customValidatingItemProcessor())
+            .processor(itemProcessor(null))
             .writer(itemWriter())
             .build();
     }
 
     @Bean
     public Job job() {
-        return this.jobBuilderFactory.get("customerValidationJob")
+        return this.jobBuilderFactory.get("itemProcessorJob")
             .start(copyFileStep())
             .build();
     }
 
+    @Bean
+    public UpperCaseNameService upperCaseNameService() {
+        return new UpperCaseNameService();
+    }
+
     public static void main(String[] args) {
-        SpringApplication.run(ValidationJob.class, "customerFile=classpath:input/customer.csv",
-            "id=2");
+        SpringApplication.run(ItemProcessorAdapterJob.class,
+            "customerFile=classpath:input/customer.csv");
     }
 }

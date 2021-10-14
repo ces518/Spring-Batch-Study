@@ -1,4 +1,4 @@
-package me.june.chapter08.validation;
+package me.june.chapter08.custom;
 
 import me.june.chapter08.domain.Customer;
 import org.springframework.batch.core.Job;
@@ -10,8 +10,6 @@ import org.springframework.batch.core.configuration.annotation.StepScope;
 import org.springframework.batch.item.ItemWriter;
 import org.springframework.batch.item.file.FlatFileItemReader;
 import org.springframework.batch.item.file.builder.FlatFileItemReaderBuilder;
-import org.springframework.batch.item.validator.BeanValidatingItemProcessor;
-import org.springframework.batch.item.validator.ValidatingItemProcessor;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.SpringApplication;
@@ -21,7 +19,7 @@ import org.springframework.core.io.Resource;
 
 @EnableBatchProcessing
 @SpringBootApplication
-public class ValidationJob {
+public class CustomItemProcessorJob {
 
     @Autowired
     private JobBuilderFactory jobBuilderFactory;
@@ -51,24 +49,13 @@ public class ValidationJob {
         return (items) -> items.forEach(System.out::println);
     }
 
-    @Bean
-    public BeanValidatingItemProcessor<Customer> customerValidatingItemProcessor() {
-        return new BeanValidatingItemProcessor<>();
-    }
-
-    @Bean
-    public UniqueLastNameValidator validator() {
-        UniqueLastNameValidator validator = new UniqueLastNameValidator();
-        validator.setName("validator");
-        return validator;
-    }
-
     /**
-     * 커스텀 벨리데이터를 사용하는 아이템 프로세서
+     * 필터링된 아이템 수는 JobRepository 에 기록된다.
+     * 4장에서 살펴본 Skip 방식과의 차이 ? -> Skip 방식은 유효한 레코드를 대상으로 처리한다.
      */
     @Bean
-    public ValidatingItemProcessor<Customer> customValidatingItemProcessor() {
-        return new ValidatingItemProcessor<>(validator());
+    public EventFilteringItemProcessor itemProcessor() {
+        return new EventFilteringItemProcessor();
     }
 
     @Bean
@@ -76,20 +63,20 @@ public class ValidationJob {
         return this.stepBuilderFactory.get("copyFileStep")
             .<Customer, Customer>chunk(5)
             .reader(customerItemReader(null))
-            .processor(customValidatingItemProcessor())
+            .processor(itemProcessor())
             .writer(itemWriter())
             .build();
     }
 
     @Bean
     public Job job() {
-        return this.jobBuilderFactory.get("customerValidationJob")
+        return this.jobBuilderFactory.get("customProcessorJob")
             .start(copyFileStep())
             .build();
     }
 
     public static void main(String[] args) {
-        SpringApplication.run(ValidationJob.class, "customerFile=classpath:input/customer.csv",
-            "id=2");
+        SpringApplication.run(CustomItemProcessorJob.class,
+            "customerFile=classpath:input/customer.csv", "script=classpath:input/lowerCase.js");
     }
 }

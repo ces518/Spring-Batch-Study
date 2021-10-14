@@ -10,8 +10,7 @@ import org.springframework.batch.item.validator.ValidationException;
 import org.springframework.batch.item.validator.Validator;
 
 /**
- * ItemStreamSupport 클래스를 통해 ItemStream 인터페이스를 구현
- * lastNames 상태를 ExecutionContext 를 통해 관리한다.
+ * ItemStreamSupport 클래스를 통해 ItemStream 인터페이스를 구현 lastNames 상태를 ExecutionContext 를 통해 관리한다.
  */
 public class UniqueLastNameValidator extends ItemStreamSupport implements Validator<Customer> {
 
