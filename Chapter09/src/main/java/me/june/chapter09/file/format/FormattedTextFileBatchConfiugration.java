@@ -1,4 +1,4 @@
-package me.june.chapter09.file;
+package me.june.chapter09.file.format;
 
 import me.june.chapter09.domain.Customer;
 import org.springframework.batch.core.Job;
@@ -54,6 +54,9 @@ public class FormattedTextFileBatchConfiugration {
             .formatted()
             .format("%s %s lived at %s %s in %s, %s.")
             .names("firstName", "middleInitial", "lastName", "address", "city", "state", "zip")
+            .shouldDeleteIfEmpty(true) // 스탭 완료시 사용된다. 기본값 false / 스탭 종료후 아무런 것도 파일에 작성되지 않았다면 (헤더,푸터 제외) 스탭완료시 해당 파일 삭제
+            .shouldDeleteIfExists(false) // 스탭의 쓰기작업 대상 파일이 존재한다면 해당 파일을 삭제한다. 기본값 true / false 로 지정된 경우에 파일이 존재한다면 ItemStreamException 이 발생
+            .append(true) // 기본값 false , true 로 지정한다면  shouldDeleteIfExists 값을 false 로 자동지정하고 결과 파일이 없다면 새파일을 생성, 결과 파일에 있다면 기존 파일에 데이터를 추가한다.
             .build();
     }
 
