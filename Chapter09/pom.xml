@@ -30,12 +30,31 @@
       <groupId>org.springframework.boot</groupId>
       <artifactId>spring-boot-starter-jdbc</artifactId>
     </dependency>
+    <dependency>
+      <groupId>org.springframework.boot</groupId>
+      <artifactId>spring-boot-starter-data-mongodb</artifactId>
+    </dependency>
+
+<!-- Neo4J 가 버전업 되면서 Java Driver 로 변경되었다. 하지만 스프링 배치에서는 지원하고 있지 않음.. !
+  The Spring Boot starter is now superseded by the Neo4j Java Driver auto config starting with Spring Boot 2.4. For Spring Boot 2.3. we will still provide support with this starter.
+  https://neo4j.com/developer/java-driver-spring-boot-starter/
+-->
+    <dependency>
+      <groupId>org.neo4j.driver</groupId>
+      <artifactId>neo4j-java-driver-spring-boot-starter</artifactId>
+      <version>4.2.7.0</version>
+    </dependency>
+    <dependency>
+      <groupId>org.neo4j</groupId>
+      <artifactId>neo4j-ogm-core</artifactId>
+      <version>3.2.21</version>
+    </dependency>
+
 
     <dependency>
       <groupId>org.springframework</groupId>
       <artifactId>spring-oxm</artifactId>
     </dependency>
-
     <dependency>
       <groupId>com.thoughtworks.xstream</groupId>
       <artifactId>xstream</artifactId>

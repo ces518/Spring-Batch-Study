@@ -7,3 +7,16 @@ spring:
   batch:
     jdbc:
       initialize-schema: always
+  jpa:
+    properties:
+      hibernate:
+        current_session_context_class: org.springframework.orm.hibernate5.SpringSessionContext
+
+  data:
+    mongodb:
+      database: customers
+  neo4j:
+    authentication:
+      username: neo4j
+      password: s3cr3t
+    uri: bolt://localhost:7687
