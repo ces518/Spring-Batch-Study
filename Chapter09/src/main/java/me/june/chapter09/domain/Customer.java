@@ -36,4 +36,5 @@ public class Customer implements Serializable {
     private String state;
     private String zip;
 
+    private String email;
 }

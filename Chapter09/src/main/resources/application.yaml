@@ -20,3 +20,19 @@ spring:
       username: neo4j
       password: s3cr3t
     uri: bolt://localhost:7687
+
+  jms:
+    cache.enabled: true
+    template:
+      receive-timeout: 5000
+      default-destination: customers
+  mail:
+    host: smtp.gmail.com
+    port: 587
+    username: pupupee9@gmail.com
+    password: pupupee3859!
+    properties:
+      mail:
+        stmp:
+          auth: true
+          starttls.enable: true
