@@ -27,10 +27,6 @@ spring:
       receive-timeout: 5000
       default-destination: customers
   mail:
-    host: smtp.gmail.com
-    port: 587
-    username: pupupee9@gmail.com
-    password: pupupee3859!
     properties:
       mail:
         stmp:
