@@ -1513,3 +1513,849 @@ public class RepositoryImportJob {
     }
 }
 ```
+
+## 그 외 출력을 위한 ItemWriter
+
+### ItemWriterAdapter
+- ItemWriterAdapter 는 기존 스프링 서비스를 ItemWriter 로 사용하는 방법을 제공한다.
+- 다른 ItemWriter 들과 마찬가지로 기존 서비스를 감싼 래퍼에 불과하다.
+
+`CustomerService.java`
+
+```java
+public class CustomerService {
+
+    public void logCustomer(Customer customer) {
+        System.out.println("I just saved" + customer);
+    }
+
+    public void logCustomerAddress(String address, String city, String state, String zip) {
+        System.out.println(
+            String.format("I just saved the address: \n %s \n %s \n %s \n %s", address, city, state, zip)
+        );
+    }
+}
+```
+
+`배치 잡 설정`
+
+```java
+@EnableBatchProcessing
+@SpringBootApplication
+public class CustomImportJob {
+
+    @Autowired
+    private JobBuilderFactory jobBuilderFactory;
+
+    @Autowired
+    private StepBuilderFactory stepBuilderFactory;
+
+    @Bean
+    @StepScope
+    public FlatFileItemReader<Customer> customerFileReader(
+        @Value("#{jobParameters['customerFile']}") Resource inputFile) {
+
+        return new FlatFileItemReaderBuilder<Customer>()
+            .name("customerFileReader")
+            .resource(inputFile)
+            .delimited()
+            .names(new String[] {"firstName",
+                "middleInitial",
+                "lastName",
+                "address",
+                "city",
+                "state",
+                "zip"})
+            .targetType(Customer.class)
+            .build();
+    }
+
+    @Bean
+    public ItemWriterAdapter<Customer> itemWriter(CustomerService customerService) {
+        ItemWriterAdapter<Customer> customerItemWriterAdapter = new ItemWriterAdapter<>();
+        customerItemWriterAdapter.setTargetObject(customerService);
+        customerItemWriterAdapter.setTargetMethod("logCustomer");
+        return customerItemWriterAdapter;
+    }
+
+    @Bean
+    public Step formatStep() throws Exception {
+        return this.stepBuilderFactory.get("customFormatStep")
+            .<Customer, Customer>chunk(10)
+            .reader(customerFileReader(null))
+            .writer(itemWriter(null))
+            .build();
+    }
+
+    @Bean
+    public Job itemWriterAdapterFormatJob() throws Exception {
+        return this.jobBuilderFactory.get("itemWriterAdapterFormatJob")
+            .start(formatStep())
+            .build();
+    }
+
+    @Bean
+    public CustomerService customerService() {
+        return new CustomerService();
+    }
+
+    public static void main(String[] args) {
+        SpringApplication.run(CustomImportJob.class, "customerFile=classpath:input/customer.csv");
+    }
+}
+```
+- ItemWriterAdapter 를 통해 서비스 객체와 호출할 메소드를 지정해 ItemWriter 로 지정한다.
+
+### PropertyExtractingDelegatingItemWriter
+- 처리해야하는 객체를 서비스가 인자로 받지 못하는 경우가 있을 수 있다.
+- 스프링 배치는 처리해야할 아이템에서 값을 추출해 서비스에 전달 할 수있는 PropertyExtractingDelegatingItemWriter 를 제공한다.
+
+`배치 잡 설정`
+
+```java
+@EnableBatchProcessing
+@SpringBootApplication
+public class PropertyExtractingDelegateJob {
+
+    @Autowired
+    private JobBuilderFactory jobBuilderFactory;
+
+    @Autowired
+    private StepBuilderFactory stepBuilderFactory;
+
+    @Bean
+    @StepScope
+    public FlatFileItemReader<Customer> customerFileReader(
+        @Value("#{jobParameters['customerFile']}") Resource inputFile) {
+
+        return new FlatFileItemReaderBuilder<Customer>()
+            .name("customerFileReader")
+            .resource(inputFile)
+            .delimited()
+            .names(new String[]{"firstName",
+                "middleInitial",
+                "lastName",
+                "address",
+                "city",
+                "state",
+                "zip"})
+            .targetType(Customer.class)
+            .build();
+    }
+
+    @Bean
+    public PropertyExtractingDelegatingItemWriter<Customer> itemWriter(
+        CustomerService customerService) {
+        PropertyExtractingDelegatingItemWriter<Customer> itemWriter = new PropertyExtractingDelegatingItemWriter<>();
+        itemWriter.setTargetObject(customerService);
+        itemWriter.setTargetMethod("logCustomerAddress");
+
+        // 객체 표기법, 인덱스 표기법 모두 지원한다.
+        itemWriter.setFieldsUsedAsTargetMethodArguments(
+            new String[]{
+                "address", "city", "state", "zip"
+            }
+        );
+        return itemWriter;
+    }
+
+    @Bean
+    public Step formatStep() throws Exception {
+        return this.stepBuilderFactory.get("customFormatStep")
+            .<Customer, Customer>chunk(10)
+            .reader(customerFileReader(null))
+            .writer(itemWriter(null))
+            .build();
+    }
+
+    @Bean
+    public Job itemWriterAdapterFormatJob() throws Exception {
+        return this.jobBuilderFactory.get("itemWriterPropertyExtractFormatJob")
+            .start(formatStep())
+            .build();
+    }
+
+    @Bean
+    public CustomerService customerService() {
+        return new CustomerService();
+    }
+
+    public static void main(String[] args) {
+        SpringApplication.run(PropertyExtractingDelegateJob.class,
+            "customerFile=classpath:input/customer.csv");
+    }
+}
+```
+- PropertyExtractingDelegatingItemWriter 로 전달할 아규먼트는 객체 표기법, 인덱스 표기법 모두 지원한다.
+
+### JmsItemWriter
+- JMS (Java Messaging Service) 는 둘 이상의 엔드포인트 간에 통신하는 메세지 지향 적인 방식이다.
+  - 점대점 통신 또는 발행-구독 모델을 이용해 통신할 수 있다.
+- 다음은 JMS 구현체로 ActiveMQ 를 사용하는 예제이다.
+
+`JmsConfig`
+
+```java
+@Configuration
+public class JmsConfig {
+
+    @Bean
+    public MessageConverter jacksonJmsMessageConverter() {
+        MappingJackson2MessageConverter converter = new MappingJackson2MessageConverter();
+        converter.setTargetType(MessageType.TEXT);
+        converter.setTypeIdPropertyName("_type");
+        return converter;
+    }
+
+    /**
+     * Spring.jms.cache.enable=true 로 설정하지 않으면 CachingConnectionFactory 를 사용하지 않는다. (JMS 커넥션 권장방식..!
+     *
+     * @param connectionFactory
+     * @return
+     */
+//    @Bean
+    public JmsTemplate jmsTemplate(ConnectionFactory connectionFactory) {
+        CachingConnectionFactory cachingConnectionFactory = new CachingConnectionFactory(
+            connectionFactory);
+        cachingConnectionFactory.afterPropertiesSet();
+        JmsTemplate jmsTemplate = new JmsTemplate(cachingConnectionFactory);
+        jmsTemplate.setDefaultDestinationName("customers");
+        jmsTemplate.setReceiveTimeout(5_000L);
+        return jmsTemplate;
+    }
+}
+```
+- MessageConverter : 메세지 본문을 특정한 포맷으로 변경하는 역할을 한다.
+- JmsTemplate : 스프링 부트가 JmsTemplate 자동 설정을 제공한다.
+  - 하지만 기본적으로 JmsTemplate 사용시 권장하는 **CachingConnectionFactory** 를 사용하지 않는다.
+  - 때문에 별도의 빈으로 구성하거나 Spring.jms.cache.enable=true 로 지정해야 한다.
+
+`배치 잡 설정`
+
+```java
+/**
+ * JMS JOB 실행순서 : 2 단계의 스탭으로 구성
+ * 1. customer.csv 를 읽음 -> ActiveMQ 에 쏜다.
+ * 2. ActiveMQ 로 부터 메세지를 읽음 -> XML 파일에 쓴다.
+ */
+@EnableBatchProcessing
+@SpringBootApplication
+public class JmsFormatJob {
+
+    @Autowired
+    private JobBuilderFactory jobBuilderFactory;
+
+    @Autowired
+    private StepBuilderFactory stepBuilderFactory;
+
+    @StepScope
+    @Bean
+    public FlatFileItemReader<Customer> customerFileReader(
+        @Value("#{jobParameters['customerFile']}") Resource inputFile) {
+
+        return new FlatFileItemReaderBuilder<Customer>()
+            .name("customerFileReader")
+            .resource(inputFile)
+            .delimited()
+            .names(new String[] {"firstName",
+                "middleInitial",
+                "lastName",
+                "address",
+                "city",
+                "state",
+                "zip"})
+            .targetType(Customer.class)
+            .build();
+    }
+
+    @StepScope
+    @Bean
+    public StaxEventItemWriter<Customer> xmlOutputWriter(
+        @Value("#{jobParameters['outputFile']}") Resource outputFile
+    ) {
+        Map<String, Class> aliases = new HashMap<>();
+        aliases.put("customer", Customer.class);
+
+        XStreamMarshaller marshaller = new XStreamMarshaller();
+        marshaller.setAliases(aliases);
+
+        return new StaxEventItemWriterBuilder<Customer>()
+            .name("xmlOutputWriter")
+            .resource(outputFile)
+            .marshaller(marshaller)
+            .rootTagName("customers")
+            .build();
+    }
+
+    @Bean
+    public JmsItemReader<Customer> jmsItemReader(JmsTemplate jmsTemplate) {
+        return new JmsItemReaderBuilder<Customer>()
+            .jmsTemplate(jmsTemplate)
+            .itemType(Customer.class)
+            .build();
+    }
+
+    @Bean
+    public JmsItemWriter<Customer> jmsItemWriter(JmsTemplate jmsTemplate) {
+        return new JmsItemWriterBuilder<Customer>()
+            .jmsTemplate(jmsTemplate)
+            .build();
+    }
+
+    @Bean
+    public Step formatInputStep() throws Exception {
+        return this.stepBuilderFactory.get("formatInputStep")
+            .<Customer, Customer>chunk(10)
+            .reader(customerFileReader(null))
+            .writer(jmsItemWriter(null))
+            .build();
+    }
+
+    @Bean
+    public Step formatOutputStep() throws Exception {
+        return this.stepBuilderFactory.get("formatOutputStep")
+            .<Customer, Customer>chunk(10)
+            .reader(jmsItemReader(null))
+            .writer(xmlOutputWriter(null))
+            .build();
+    }
+
+    @Bean
+    public Job job() throws Exception {
+        return this.jobBuilderFactory.get("jmsFormatJob")
+            .start(formatInputStep())
+            .next(formatOutputStep())
+            .build();
+    }
+
+    public static void main(String[] args) {
+        SpringApplication.run(JmsFormatJob.class, "customerFile=classpath:input/customer.csv", "outputFile=file:result.xml");
+    }
+}
+```
+- 위 잡 구성은 총 2단계의 스탭으로 구성되어 있다.
+  1. customer.csv 를 읽음 -> ActiveMQ 에 쏜다.
+  2. ActiveMQ 로 부터 메세지를 읽음 -> XML 파일에 쓴다.
+
+### SimpleMessageItemWriter
+- 이메일 보내는 기능은 매우 유용한 기능중 하나이다.
+- 잡이 완료되면 메일을 받는 다거나 스팸메일을 보내는 등의 작업이 필요할 수 있다.
+- 스프링 배치는 SimpleMessageItemWriter 를 통해 이메일을 보낼 수 있는 ItemWriter 를 제공한다.
+
+`Customer.java`
+
+```java
+@Data
+@Entity
+@Table(name = "customer")
+public class Customer implements Serializable {
+
+    private static final long serialVersionUID = 1L;
+
+    @Id
+    @GeneratedValue(strategy = GenerationType.IDENTITY)
+    private long id;
+    private String firstName;
+    private String middleInitial;
+    private String lastName;
+    private String address;
+    private String city;
+    private String state;
+    private String zip;
+    private String email;
+}
+```
+
+`배치 잡 설정`
+
+```java
+@EnableBatchProcessing
+@SpringBootApplication
+@EntityScan(basePackages = "me.june.chapter09.domain")
+public class SimpleMailJob {
+
+    @Autowired
+    private JobBuilderFactory jobBuilderFactory;
+
+    @Autowired
+    private StepBuilderFactory stepBuilderFactory;
+
+    @StepScope
+    @Bean
+    public FlatFileItemReader<Customer> customerFileReader(
+        @Value("#{jobParameters['customerFile']}") Resource inputFile) {
+
+        return new FlatFileItemReaderBuilder<Customer>()
+            .name("customerFileReader")
+            .resource(inputFile)
+            .delimited()
+            .names(new String[]{"firstName",
+                "middleInitial",
+                "lastName",
+                "address",
+                "city",
+                "state",
+                "zip",
+                "email"})
+            .targetType(Customer.class)
+            .build();
+    }
+
+    @Bean
+    public JpaItemWriter<Customer> customerBatchWriter(EntityManagerFactory entityManagerFactory) {
+        return new JpaItemWriterBuilder<Customer>()
+            .entityManagerFactory(entityManagerFactory)
+            .build();
+    }
+
+    @Bean
+    public JpaCursorItemReader<Customer> customerCursorItemReader(
+        EntityManagerFactory entityManagerFactory) {
+        return new JpaCursorItemReaderBuilder<Customer>()
+            .name("customerCursorItemReader")
+            .entityManagerFactory(entityManagerFactory)
+            .queryString("select c from Customer c")
+            .build();
+    }
+
+    @Bean
+    public SimpleMailMessageItemWriter emailItemWriter(MailSender mailSender) {
+        return new SimpleMailMessageItemWriterBuilder()
+            .mailSender(mailSender)
+            .build();
+    }
+
+    @Bean
+    public Step importStep() throws Exception {
+        return this.stepBuilderFactory.get("importStep")
+            .<Customer, Customer>chunk(10)
+            .reader(customerFileReader(null))
+            .writer(customerBatchWriter(null))
+            .build();
+    }
+
+    @Bean
+    public Step emailStep() throws Exception {
+        return this.stepBuilderFactory.get("emailStep")
+            .<Customer, SimpleMailMessage>chunk(10)
+            .reader(customerCursorItemReader(null))
+            .processor((ItemProcessor<Customer, SimpleMailMessage>) customer -> {
+                SimpleMailMessage mail = new SimpleMailMessage();
+                mail.setFrom("pupupee9@gamil.com");
+                mail.setTo(customer.getEmail());
+                mail.setSubject("Welcome!");
+                mail.setText(
+                    String.format(
+                        "Welcome %s %s, \n You were imported into the system using Spring Batch!",
+                        customer.getFirstName(), customer.getLastName())
+                );
+                return mail;
+            })
+            .writer(emailItemWriter(null))
+            .build();
+    }
+
+    @Bean
+    public Job emailJob() throws Exception {
+        return this.jobBuilderFactory.get("emailJob")
+            .start(importStep())
+            .next(emailStep())
+            .build();
+    }
+
+    public static void main(String[] args) {
+        SpringApplication.run(SimpleMailJob.class,
+            "customerFile=classpath:input/customerWithEmail.csv", "id=1");
+    }
+}
+```
+
+## 여러 자원을 사용하는 ItemWriter
+
+### MultiResourceItemWriter
+- MultiResourceItemWriter 는 처리한 레코드 수에 따라 출력 리소스를 **동적** 으로 만든다.
+- 다음은 MultiResourceItemWriter 를 사용하는 스탭의 흐름이다.
+
+![MultiResourceItemWriter](./multi_resource_itemwriter.png)
+
+`MultiResourceItemWriter 구성 옵션`
+
+| Option | Type | Default | Description |
+| --- | --- | --- | --- |
+| delegate | ResourceAwareItemWriterItemStream | null (필수) | MultiResourceItemWriter 가 각 아이템을 쓰는데 사용한다. |
+| itemCountLimitPerResource | int | Integer.MAX_VALUE | 각 리소스에 쓰기 작업을 수행할 아이템 수 |
+| resource | Resource | null (필수) | MultiResourceItemWriter 가 생성할 리소스의 프로토타입 |
+| resourceSuffixCreator | ResourceSuffixCreator | null | 해당 옵션을 지정하면 MultiResourceItemWriter 는 생성하는 파일 이름의 끝에 접미사 생성시 이를 활용한다. |
+| saveState | boolean | true | false 로 지정하면, ItemWriter 의 상태가 JobRepository 에 유지되지 않는다. |
+
+`CustomerOutputFileSuffixCreator`
+
+```java
+public class CustomerOutputFileSuffixCreator implements ResourceSuffixCreator {
+
+    @Override
+    public String getSuffix(int index) {
+        return index + ".xml";
+    }
+}
+```
+- ResourceSuffixCreator 를 구현해 출력 파일의 접미사로 index + .xml 형태로 생성하도록 구성한다.
+
+`CustomerXmlHeaderCallback`
+
+```java
+public class CustomerXmlHeaderCallback implements StaxWriterCallback {
+
+    @Override
+    public void write(XMLEventWriter writer) throws IOException {
+        XMLEventFactory factory = XMLEventFactory.newInstance();
+
+        try {
+            writer.add(factory.createStartElement("", "", "identification"));
+            writer.add(factory.createStartElement("", "", "author"));
+            writer.add(factory.createAttribute("name", "ncucu"));
+            writer.add(factory.createEndElement("", "", "author"));
+            writer.add(factory.createEndElement("", "", "identification"));
+        } catch (XMLStreamException e) {
+            e.printStackTrace();
+        }
+    }
+}
+```
+- StaxWriterCallback 를 구현해 XML 파일을 쓸때 Header Fragment 를 생성하도록 구성한다.
+
+`CustomerRecordCountFooterCallback`
+
+```java
+@Component
+@Aspect
+public class CustomerRecordCountFooterCallback implements FlatFileFooterCallback {
+
+    private int itemsWritteInCurrentFile = 0;
+
+    @Override
+    public void writeFooter(Writer writer) throws IOException {
+        writer.write("This file contains" + itemsWritteInCurrentFile + "items");
+    }
+
+    /**
+     * @Aspect 를 적용하는 이유 ?
+     * -> MultiResourceItemWriter.write 호출 하기 전 Listener.write 가 호출된다.
+     * 하지만 FlatFileItemWriter.open 에 대한 호출은 MultiResourceItemWriter.write 내부에서 이뤄짐
+     * 때문에 FlatFileItemWriter.write 호출전 카운터를 초기화 하는 용도
+     */
+    @Before("execution(* org.springframework.batch.item.support.AbstractFileItemWriter.open(..))")
+    public void resetCounter() {
+        this.itemsWritteInCurrentFile = 0;
+    }
+
+    @Before("execution(* org.springframework.batch.item.support.AbstractFileItemWriter.write(..))")
+    public void beforeWrite(JoinPoint joinPoint) {
+        List<Customer> items = (List<Customer>) joinPoint.getArgs()[0];
+        this.itemsWritteInCurrentFile += items.size();
+    }
+}
+```
+- 플랫파일에 푸터가 필요할 경우 FlatFileFooterCallback 를 구현해 FlatFile 의 마지막에 레코드 수를 기록하는 푸터를 적용한다.
+- MultiResourceItemWriter 를 사용한다면 아잍메 수를 계산하기 위해 @Aspect 를 활용해야 한다.
+- ItemWriterListener 를 사용하지 않는 이유는 다음과 같다.
+  - 메소드 호출 순서때문
+  - MultiResourceItemWriter.write 호출 이전 ItemWriteListener.beforeWrite 가 호출됨
+  - FlatFileItemWriter.open 에 대한 호출은 MultiResourceItemWriter.write 내부에서 이루어진다.
+  - 때문에 MultiResourceItemWriter.write 가 호출되기 전 카운트를 초기화 해야하기 때문에 @Aspect 를 활용해야 한다.
+
+`배치 잡 설정`
+
+```java
+@EnableBatchProcessing
+@SpringBootApplication
+@EntityScan(basePackages = "me.june.chapter09.domain")
+public class MultiResourceJob {
+
+    @Autowired
+    private JobBuilderFactory jobBuilderFactory;
+
+    @Autowired
+    private StepBuilderFactory stepBuilderFactory;
+
+    @Bean
+    public JpaCursorItemReader<Customer> customerCursorItemReader(
+        EntityManagerFactory entityManagerFactory
+    ) {
+        return new JpaCursorItemReaderBuilder<Customer>()
+            .name("customerCursorItemReader")
+            .entityManagerFactory(entityManagerFactory)
+            .queryString("select c from Customer c")
+            .build();
+    }
+
+    @StepScope
+    @Bean
+    public StaxEventItemWriter<Customer> delegateItemWriter() throws Exception {
+        Map<String, Class> aliases = new HashMap<>();
+        aliases.put("customer", Customer.class);
+
+        XStreamMarshaller marshaller = new XStreamMarshaller();
+        marshaller.setAliases(aliases);
+        marshaller.afterPropertiesSet();
+
+        return new StaxEventItemWriterBuilder<Customer>()
+            .name("customerItemWriter")
+            .marshaller(marshaller)
+            .rootTagName("customers")
+            .headerCallback(headerCallback())
+            .build();
+    }
+
+    @StepScope
+    @Bean
+    public FlatFileItemWriter<Customer> delegateCustomerItemWriter(
+        CustomerRecordCountFooterCallback footerCallback
+    ) throws Exception {
+        BeanWrapperFieldExtractor<Customer> fieldExtractor = new BeanWrapperFieldExtractor<>();
+        fieldExtractor.setNames(
+            new String[]{"firstName", "lastName", "address", "city", "state", "zip"}
+        );
+        fieldExtractor.afterPropertiesSet();
+
+        FormatterLineAggregator<Customer> lineAggregator = new FormatterLineAggregator<>();
+        lineAggregator.setFormat("%s %s lived at %s %s in %s, %s.");
+        lineAggregator.setFieldExtractor(fieldExtractor);
+
+        FlatFileItemWriter<Customer> itemWriter = new FlatFileItemWriter<>();
+        itemWriter.setName("delegateCustomerItemWriter");
+        itemWriter.setLineAggregator(lineAggregator);
+        itemWriter.setAppendAllowed(true);
+        itemWriter.setFooterCallback(footerCallback);
+        return itemWriter;
+    }
+
+    @Bean
+    public MultiResourceItemWriter<Customer> multiCustomerFilerWriter() throws Exception {
+        return new MultiResourceItemWriterBuilder<Customer>()
+            .name("multiCustomerFilerWriter")
+            .delegate(delegateCustomerItemWriter(null)) // 실제 아이템을 처리할 writer
+            .itemCountLimitPerResource(25) // 25개 단위로 파일을 쓴다.
+            .resource(new FileSystemResource("Chapter09/customer"))
+//            .resourceSuffixCreator(suffixCreator())
+            .build();
+    }
+
+    @Bean
+    public CustomerOutputFileSuffixCreator suffixCreator() throws Exception {
+        return new CustomerOutputFileSuffixCreator();
+    }
+
+    @Bean
+    public CustomerXmlHeaderCallback headerCallback() throws Exception {
+        return new CustomerXmlHeaderCallback();
+    }
+
+    @Bean
+    public Step multiXmlGeneratorStep() throws Exception {
+        return this.stepBuilderFactory.get("multiXmlGeneratorStep")
+            .<Customer, Customer>chunk(10)
+            .reader(customerCursorItemReader(null))
+            .writer(multiCustomerFilerWriter())
+            .build();
+    }
+
+    @Bean
+    public Job xmlGeneratorJob() throws Exception {
+        return this.jobBuilderFactory.get("xmlGeneratorJob")
+            .start(multiXmlGeneratorStep())
+            .build();
+    }
+
+    public static void main(String[] args) {
+        SpringApplication.run(MultiResourceJob.class, "id=5");
+    }
+}
+
+```
+
+### CompositeItemWriter
+- 지금까지는 하나의 스탭에서 하나의 출력 결과를 만들었다.
+- 하지만 실무 환경에서는 배치 잡이 이렇게 간단하지만은 않다.
+- 필요에 따라 여러 장소에 쓰기 작업이 필요할 수 있따.
+- 스프링 배치는 CompositeItemWriter 를 통해 스탭 내에서 여러 ItemWriter 가 동일한 아이템 대해 쓰기 작업을 수행할 수 있도록 제공한다.
+
+`CompositeItemWriter Step`
+
+![CompositeItemWriter](composite_itemwriter.png)
+
+`배치잡 설정`
+
+```java
+/**
+ * 몇개의 Writer 를 사용하던지, 스프링배치는 아이템의 수를 세고했다. 때문에 Writer 를 2개 조합해서 사용했다고 해서, WriterCount 가 2배가 되진
+ * 않는다.
+ */
+@EnableBatchProcessing
+@SpringBootApplication
+@EntityScan(basePackages = "me.june.chapter09.domain")
+public class CompositeItemWriterJob {
+
+    @Autowired
+    private JobBuilderFactory jobBuilderFactory;
+
+    @Autowired
+    private StepBuilderFactory stepBuilderFactory;
+
+    @StepScope
+    @Bean
+    public FlatFileItemReader<Customer> customerFileReader(
+        @Value("#{jobParameters['customerFile']}") Resource inputFile) {
+
+        return new FlatFileItemReaderBuilder<Customer>()
+            .name("customerFileReader")
+            .resource(inputFile)
+            .delimited()
+            .names(new String[]{"firstName",
+                "middleInitial",
+                "lastName",
+                "address",
+                "city",
+                "state",
+                "zip",
+                "email"})
+            .targetType(Customer.class)
+            .build();
+    }
+
+    @StepScope
+    @Bean
+    public StaxEventItemWriter<Customer> xmlDelegateItemWriter(
+        @Value("#{jobParameters['outputFile']}") Resource outputFile
+    ) throws Exception {
+        Map<String, Class> aliases = new HashMap<>();
+        aliases.put("customer", Customer.class);
+
+        XStreamMarshaller marshaller = new XStreamMarshaller();
+        marshaller.setAliases(aliases);
+        marshaller.afterPropertiesSet();
+
+        return new StaxEventItemWriterBuilder<Customer>()
+            .name("customerItemWriter")
+            .resource(outputFile)
+            .marshaller(marshaller)
+            .rootTagName("customers")
+            .build();
+    }
+
+    @Bean
+    public JpaItemWriter<Customer> jpaDeleteItemWriter(EntityManagerFactory entityManagerFactory) {
+        return new JpaItemWriterBuilder<Customer>()
+            .entityManagerFactory(entityManagerFactory)
+            .build();
+    }
+
+    @Bean
+    public CompositeItemWriter<Customer> compositeItemWriter() throws Exception {
+        return new CompositeItemWriterBuilder<Customer>()
+            .delegates(
+                List.of(xmlDelegateItemWriter(null), jpaDeleteItemWriter(null))
+            )
+            .build();
+    }
+
+    @Bean
+    public ClassifierCompositeItemWriter<Customer> classifierCompositeItemWriter()
+        throws Exception {
+        Classifier<Customer, ItemWriter<? super Customer>> classifier =
+            new CustomerClassifier(xmlDelegateItemWriter(null), jpaDeleteItemWriter(null));
+        return new ClassifierCompositeItemWriterBuilder<Customer>()
+            .classifier(classifier)
+            .build();
+    }
+
+    @Bean
+    public Step compositeWriterStep() throws Exception {
+        return this.stepBuilderFactory.get("compositeWriterStep")
+            .<Customer, Customer>chunk(10)
+            .reader(customerFileReader(null))
+            .writer(compositeItemWriter())
+            .build();
+    }
+
+    @Bean
+    public Job compositeWriterJob() throws Exception {
+        return this.jobBuilderFactory.get("compositeWriterJob")
+            .start(compositeWriterStep())
+            .build();
+    }
+
+    public static void main(String[] args) {
+        SpringApplication.run(CompositeItemWriterJob.class,
+            "customerFile=classpath:input/customerWithEmail.csv",
+            "outputFile=file:xmlCustomer.xml",
+            "id=1");
+    }
+}
+```
+- 스프링 배치는, ItemWriter 를 통해 쓰기 작업을 수행한 수를 기록한다.
+- 여기서 주의해야할 점은 CompositeItemWriter 를 이용해 몇개의 ItemWriter 를 사용했던 간에 Item 의 Counting 은 CompositeItemWriter 에 주입된 아이템의 수만큼만 기록된다.
+
+### ClassifierCompositeItemWriter
+- ItemProcessor 에서 살펴본 Classifier 와 매우 유사하다.
+- ClassifierCompositeItemWriter 는 특정 조건에 따라 아이템 쓰기 작업을 수행할 ItemWriter 를 반환해 처리를 위임한다.
+
+`CustomerClassifier`
+
+```java
+public class CustomerClassifier implements Classifier<Customer, ItemWriter<? super Customer>> {
+
+    private ItemWriter<Customer> fileItemWriter;
+    private ItemWriter<Customer> jpaItemWriter;
+
+    public CustomerClassifier(
+        ItemWriter<Customer> fileItemWriter,
+        ItemWriter<Customer> jpaItemWriter
+    ) {
+        this.fileItemWriter = fileItemWriter;
+        this.jpaItemWriter = jpaItemWriter;
+    }
+
+    @Override
+    public ItemWriter<? super Customer> classify(Customer customer) {
+        if (customer.getState().matches("^[A-M].*")) {
+            return fileItemWriter;
+        }
+        return jpaItemWriter;
+    }
+}
+```
+
+### ItemStream 인터페이스
+- ItemStream 인터페이스는 주기적으로 **상태를 저장하고 복원 하는 역할** 을 수행한다.
+- open, update, close 가지가 메소드로 구성되어 있다.
+
+```java
+public interface ItemStream {
+
+	/**
+	 * Open the stream for the provided {@link ExecutionContext}.
+	 *
+	 * @param executionContext current step's {@link org.springframework.batch.item.ExecutionContext}.  Will be the
+	 *                            executionContext from the last run of the step on a restart.
+	 * @throws IllegalArgumentException if context is null
+	 */
+	void open(ExecutionContext executionContext) throws ItemStreamException;
+
+	/**
+	 * Indicates that the execution context provided during open is about to be saved. If any state is remaining, but
+	 * has not been put in the context, it should be added here.
+	 * 
+	 * @param executionContext to be updated
+	 * @throws IllegalArgumentException if executionContext is null.
+	 */
+	void update(ExecutionContext executionContext) throws ItemStreamException;
+
+	/**
+	 * If any resources are needed for the stream to operate they need to be destroyed here. Once this method has been
+	 * called all other methods (except open) may throw an exception.
+	 */
+	void close() throws ItemStreamException;
+}
+```
+- CompositeItemWriter 는 ItemStream 인터페이스를 구현하고 있지만, ClassifierCompositeItemWriter 는 이를 구현하고 있지 않기 때문에 유의해야 한다.
